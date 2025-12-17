@@ -1,0 +1,28 @@
+#unused folder
+/tools
+/delineator
+/core
+
+# 编译文件
+*.o
+*.mod
+*.exe
+
+# 输出文件
+out/
+output/
+*.nc
+*.csv
+*.txt
+log/
+*.log
+
+# 临时文件
+*.swp
+*~
+__pycache__/
+*.pyc
+
+# 系统文件
+.DS_Store
+

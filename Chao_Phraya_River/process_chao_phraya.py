@@ -1,0 +1,352 @@
+#!/usr/bin/env python3
+"""
+Processes and standardizes the Chao Phraya River discharge and suspended
+sediment dataset from PANGAEA (doi:10.1594/PANGAEA.981111) into CF-1.8
+compliant NetCDF files.
+
+This script performs the following steps:
+1.  Reads the original tab-separated data file.
+2.  Parses station metadata from the file header.
+3.  Cleans and structures the data, handling duplicates.
+4.  Converts units from source (km³/a, Mt/a) to CF standard (m³/s, ton/day).
+5.  Calculates Suspended Sediment Concentration (SSC) from discharge and load.
+6.  Performs quality control checks and assigns flags based on physical ranges.
+7.  For each station with sediment data, creates a NetCDF file containing the
+    complete annual time series.
+8.  Generates a comprehensive CSV summary file for all processed stations.
+"""
+
+import os
+import re
+import pandas as pd
+import numpy as np
+import netCDF4 as nc
+from datetime import datetime
+
+# --- Configuration ---
+
+# File paths
+# Note: These paths are relative to the script's execution directory.
+# The script assumes it is run from /Users/zhongwangwei/Downloads/Sediment/Script/Dataset/Chao_Phraya_River/
+SOURCE_DATA_PATH = "../../../Source/Chao_Phraya_River/Chao_Phraya_River.tab"
+OUTPUT_DIR = "../../../Output_r/annually_climatology/Chao_Phraya_River"
+SUMMARY_DIR = "../../../Output_r/annually_climatology/Chao_Phraya_River"
+
+
+# Constants for unit conversion
+SECONDS_PER_YEAR = 365.25 * 24 * 3600  # 31,557,600
+KM3_TO_M3 = 1e9
+MT_TO_TON = 1e6
+DAYS_PER_YEAR = 365.25
+# Factor for SSC = SSL / (Q * 86.4) where 86.4 = (86400 s/day * 1000 L/m³) / 1e6 mg/ton
+SSC_CONVERSION_FACTOR = 86.4
+
+# Quality control thresholds
+Q_MIN_THRESHOLD = 0.0
+SSC_MIN_THRESHOLD = 0.1  # As per user request (assuming mg/L)
+SSC_MAX_THRESHOLD = 3000.0 # As per user request
+SSL_MIN_THRESHOLD = 0.0
+
+# Metadata
+FILL_VALUE = -9999.0
+REFERENCE_DATE = "1970-01-01 00:00:00"
+CONVENTIONS = "CF-1.8, ACDD-1.3"
+CREATOR_NAME = "Zhongwang Wei"
+CREATOR_EMAIL = "weizhw6@mail.sysu.edu.cn"
+CREATOR_INSTITUTION = "Sun Yat-sen University, China"
+DATASET_NAME = "Chao_Phraya_River Dataset"
+SOURCE_REFERENCE = "Wei, Bingbing (2025): Measured and estimated discharge and suspended sediment flux of the Chao Phraya River... PANGAEA, https://doi.org/10.1594/PANGAEA.981111"
+SOURCE_LINK = "https://doi.org/10.1594/PANGAEA.981111"
+
+# --- Helper Functions ---
+
+def parse_station_metadata(file_path):
+    """Parses station metadata from the header of the PANGAEA data file."""
+    stations = {}
+    with open(file_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            if 'LATITUDE:' in line and 'METHOD/DEVICE' in line:
+                parts = line.strip().split('*')
+                station_part = parts[0].replace('Event(s):', '').strip()
+                print(f"DEBUG: Parsing station_part: '{station_part}'")
+                match = re.match(r'(.+?)\s+\((.+?)\)', station_part)
+                if match:
+                    event_id, short_id = match.group(1).strip(), match.group(2).strip()
+                    lat_match = re.search(r'LATITUDE:\s*([\d.]+)', line)
+                    lon_match = re.search(r'LONGITUDE:\s*([\d.]+)', line)
+                    loc_match = re.search(r'LOCATION:\s*([^*]+)', line)
+                    stations[event_id] = {
+                        'station_id': short_id,
+                        'lat': float(lat_match.group(1)) if lat_match else None,
+                        'lon': float(lon_match.group(1)) if lon_match else None,
+                        'river': loc_match.group(1).strip() if loc_match else "Unknown"
+                    }
+            if line.startswith('Event\t'):
+                break
+    return stations
+
+def read_and_clean_data(file_path):
+    """Reads and cleans the tab-delimited data."""
+    with open(file_path, 'r', encoding='utf-8') as f:
+        for i, line in enumerate(f):
+            if line.startswith('Event\t'):
+                skiprows = i
+                break
+    df = pd.read_csv(file_path, sep='\t', skiprows=skiprows)
+    df.columns = [c.strip() for c in df.columns]
+    df = df.rename(columns={
+        'Event': 'event', 'Station': 'station', 'River': 'river',
+        'Comment': 'comment', 'Date/Time': 'year',
+        'Q [km**3/a]': 'Q_km3_a', 'Ms [Mt/a]': 'Ms_Mt_a'
+    })
+    df['year'] = pd.to_numeric(df['year'], errors='coerce')
+    df['Q_km3_a'] = pd.to_numeric(df['Q_km3_a'], errors='coerce')
+    df['Ms_Mt_a'] = pd.to_numeric(df['Ms_Mt_a'], errors='coerce')
+    df['data_score'] = df['Q_km3_a'].notna().astype(int) + df['Ms_Mt_a'].notna().astype(int)
+    df = df.sort_values(['event', 'year', 'data_score'], ascending=[True, True, False])
+    df = df.drop_duplicates(subset=['event', 'year'], keep='first')
+    return df.drop(columns=['data_score'])
+
+def convert_units_and_calculate_ssc(df):
+    """Converts units and calculates SSC."""
+    df['Q'] = df['Q_km3_a'] * KM3_TO_M3 / SECONDS_PER_YEAR
+    df['SSL'] = df['Ms_Mt_a'] * MT_TO_TON / DAYS_PER_YEAR
+    df['SSC'] = (df['SSL'] * 1e9) / (df['Q'] * 86400 * 1000)
+    return df
+
+def assign_quality_flags(df):
+    """Assigns quality flags to Q, SSC, and SSL."""
+    df['Q_flag'] = 9
+    df.loc[df['Q'].notna(), 'Q_flag'] = 0
+    df.loc[df['Q'] < Q_MIN_THRESHOLD, 'Q_flag'] = 3
+    df.loc[df['Q'] == 0, 'Q_flag'] = 2
+
+    df['SSC_flag'] = 9
+    df.loc[df['SSC'].notna(), 'SSC_flag'] = 0
+    df.loc[df['SSC'] < SSC_MIN_THRESHOLD, 'SSC_flag'] = 3
+    df.loc[df['SSC'] > SSC_MAX_THRESHOLD, 'SSC_flag'] = 2
+
+    df['SSL_flag'] = 9
+    df.loc[df['SSL'].notna(), 'SSL_flag'] = 0
+    df.loc[df['SSL'] < SSL_MIN_THRESHOLD, 'SSL_flag'] = 3
+    return df
+
+def create_netcdf_file(station_id, event_id, meta, data, output_dir):
+    """Creates a CF-1.8 compliant NetCDF file for a station."""
+    filename = f"{DATASET_NAME.replace(' ', '_')}_{station_id.replace('.', '_')}.nc"
+    filepath = os.path.join(output_dir, filename)
+    
+    with nc.Dataset(filepath, 'w', format='NETCDF4') as ds:
+        # --- Dimensions ---
+        ds.createDimension('time', None)
+
+        # --- Global Attributes ---
+        ds.Conventions = CONVENTIONS
+        ds.title = "Harmonized Global River Discharge and Sediment"
+        ds.source = "In-situ station data"
+        ds.data_source_name = DATASET_NAME
+        ds.station_name = station_id
+        ds.river_name = meta['river']
+        ds.Source_ID = station_id.replace('.', '_')
+        ds.featureType = "timeSeries"
+        ds.geospatial_lat_min = meta['lat']
+        ds.geospatial_lat_max = meta['lat']
+        ds.geospatial_lon_min = meta['lon']
+        ds.geospatial_lon_max = meta['lon']
+        ds.geographic_coverage = f"{meta['river']} Basin, Thailand"
+        
+        valid_data = data.dropna(subset=['Q', 'SSL'], how='all')
+        if not valid_data.empty:
+            start_year, end_year = int(valid_data['year'].min()), int(valid_data['year'].max())
+            ds.time_coverage_start = f"{start_year}-01-01"
+            ds.time_coverage_end = f"{end_year}-12-31"
+            ds.temporal_span = f"{start_year}-{end_year}"
+
+        ds.temporal_resolution = "annually"
+        ds.variables_provided = "altitude, upstream_area, Q, SSC, SSL, station_name, river_name, Source_ID"
+        ds.number_of_data = len(data)
+        ds.reference = SOURCE_REFERENCE
+        ds.source_data_link = SOURCE_LINK
+        ds.creator_name = CREATOR_NAME
+        ds.creator_email = CREATOR_EMAIL
+        ds.creator_institution = CREATOR_INSTITUTION
+        ds.date_created = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+        ds.history = f"{ds.date_created}: Data processed from source. Script: process_chao_phraya.py."
+        ds.summary = f"This file contains annual time series data for station {station_id} on the {meta['river']}."
+
+        # --- Coordinate Variables ---
+        time = ds.createVariable('time', 'f8', ('time',))
+        time.units = f"days since {REFERENCE_DATE}"
+        time.standard_name = "time"
+        time.long_name = "time"
+        time.calendar = "gregorian"
+        time[:] = nc.date2num(pd.to_datetime(data['year'], format='%Y').to_list(), time.units, time.calendar)
+
+        lat = ds.createVariable('lat', 'f4')
+        lat.units = "degrees_north"
+        lat.standard_name = "latitude"
+        lat.long_name = "station latitude"
+        lat[:] = meta['lat']
+
+        lon = ds.createVariable('lon', 'f4')
+        lon.units = "degrees_east"
+        lon.standard_name = "longitude"
+        lon.long_name = "station longitude"
+        lon[:] = meta['lon']
+
+        alt = ds.createVariable('altitude', 'f4', fill_value=FILL_VALUE)
+        alt.standard_name = "altitude"
+        alt.long_name = "station elevation above sea level"
+        alt.units = "m"
+        alt.positive = "up"
+        alt.comment = "Source: Not available in original dataset."
+        alt[:] = FILL_VALUE
+
+        area = ds.createVariable('upstream_area', 'f4', fill_value=FILL_VALUE)
+        area.long_name = "upstream drainage area"
+        area.units = "km2"
+        area.comment = "Source: Not available in original dataset."
+        area[:] = FILL_VALUE
+
+        # --- Data Variables ---
+        def create_variable(name, std_name, long_name, units, comment, values, flag_values):
+            var = ds.createVariable(name, 'f4', ('time',), fill_value=FILL_VALUE)
+            var.standard_name = std_name
+            var.long_name = long_name
+            var.units = units
+            var.comment = comment
+            var.coordinates = "lat lon"
+            var.ancillary_variables = f"{name}_flag"
+            var[:] = values.fillna(FILL_VALUE).values
+
+            flag_var = ds.createVariable(f"{name}_flag", 'i1', ('time',), fill_value=9)
+            flag_var.long_name = f"Quality flag for {long_name}"
+            flag_var.standard_name = "status_flag"
+            flag_var.flag_values = np.array([0, 1, 2, 3, 9], dtype='i1')
+            flag_var.flag_meanings = "good_data estimated_data suspect_data bad_data missing_data"
+            flag_var[:] = flag_values.values
+        
+        create_variable('Q', 'river_discharge', 'River Discharge', 'm3 s-1',
+                        f"Calculated from km³/a. Formula: Q * {KM3_TO_M3} / {SECONDS_PER_YEAR}",
+                        data['Q'], data['Q_flag'])
+        create_variable('SSC', 'mass_concentration_of_suspended_matter_in_water', 'Suspended Sediment Concentration', 'mg L-1',
+                        f"Calculated from SSL and Q. Formula: SSC(mg/L) = (SSL(ton/day) * 1e9) / (Q(m3/s) * 86400 * 1000)",
+                        data['SSC'], data['SSC_flag'])
+        create_variable('SSL', 'suspended_sediment_load', 'Suspended Sediment Load', 'ton day-1',
+                        f"Calculated from Mt/a. Formula: SSL * {MT_TO_TON} / {DAYS_PER_YEAR}",
+                        data['SSL'], data['SSL_flag'])
+
+    print(f"  -> Saved: {filepath}")
+
+def generate_summary_csv(all_data, stations, output_dir):
+    """Generates a summary CSV file for all stations."""
+    summary_data = []
+    for event, meta in stations.items():
+        station_data = all_data[all_data['event'] == event]
+        if station_data.empty:
+            continue
+
+        def get_stats(series_name):
+            series = station_data[series_name]
+            valid_series = series.dropna()
+            if valid_series.empty:
+                return None, None, 0.0
+            start = int(station_data.loc[valid_series.index, 'year'].min())
+            end = int(station_data.loc[valid_series.index, 'year'].max())
+            completeness = (len(valid_series) / len(station_data)) * 100
+            return start, end, completeness
+
+        q_start, q_end, q_perc = get_stats('Q')
+        ssc_start, ssc_end, ssc_perc = get_stats('SSC')
+        ssl_start, ssl_end, ssl_perc = get_stats('SSL')
+
+        summary_data.append({
+            'Source_ID': meta['station_id'].replace('.', '_'),
+            'station_name': meta['station_id'],
+            'river_name': meta['river'],
+            'longitude': meta['lon'],
+            'latitude': meta['lat'],
+            'altitude': FILL_VALUE,
+            'upstream_area': FILL_VALUE,
+            'Q_start_date': q_start or '',
+            'Q_end_date': q_end or '',
+            'Q_percent_complete': f"{q_perc:.1f}" if q_perc > 0 else "0.0",
+            'SSC_start_date': ssc_start or '',
+            'SSC_end_date': ssc_end or '',
+            'SSC_percent_complete': f"{ssc_perc:.1f}" if ssc_perc > 0 else "0.0",
+            'SSL_start_date': ssl_start or '',
+            'SSL_end_date': ssl_end or '',
+            'SSL_percent_complete': f"{ssl_perc:.1f}" if ssl_perc > 0 else "0.0",
+            'Data Source Name': DATASET_NAME,
+            'Type': 'In-situ station data',
+            'Temporal Resolution': 'annually',
+            'Temporal Span': f"{station_data['year'].min()}-{station_data['year'].max()}",
+            'Variables Provided': 'Q, SSC, SSL',
+            'Geographic Coverage': f"{meta['river']} Basin, Thailand",
+            'Reference/DOI': SOURCE_LINK
+        })
+    
+    summary_df = pd.DataFrame(summary_data)
+    summary_path = os.path.join(output_dir, f"{DATASET_NAME.replace(' ', '_')}_station_summary.csv")
+    summary_df.to_csv(summary_path, index=False)
+    print(f"  -> Saved: {summary_path}")
+
+# --- Main Execution ---
+
+def main():
+    """Main function to run the data processing workflow."""
+    print("---"" Starting Chao Phraya River Data Processing ---")
+    
+    # Ensure output directory exists
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    
+    # 1. Parse Metadata
+    print("[1/6] Parsing station metadata...")
+    stations = parse_station_metadata(SOURCE_DATA_PATH)
+    print(f"  Found metadata for {len(stations)} stations.")
+    
+    # 2. Read and Clean Data
+    print("[2/6] Reading and cleaning data...")
+    df = read_and_clean_data(SOURCE_DATA_PATH)
+    print(f"  Loaded {len(df)} unique annual records.")
+    
+    # 3. Convert Units
+    print("[3/6] Converting units and calculating SSC...")
+    df = convert_units_and_calculate_ssc(df)
+    
+    # 4. Assign Quality Flags
+    print("[4/6] Assigning quality flags...")
+    df = assign_quality_flags(df)
+    
+    # 5. Create NetCDF files
+    print("[5/6] Creating NetCDF files for stations with sediment data...")
+    stations_with_sediment = df[df['SSL'].notna()]['event'].unique()
+    for event, meta in stations.items():
+        if event in stations_with_sediment:
+            station_data = df[df['event'] == event].copy()
+            # Truncate time
+            valid_indices = station_data['Q'].notna() | station_data['SSL'].notna()
+            if not valid_indices.any():
+                print(f"  Skipping {meta['station_id']}: No valid Q or SSL data.")
+                continue
+            
+            start_year = station_data.loc[valid_indices, 'year'].min()
+            end_year = station_data.loc[valid_indices, 'year'].max()
+            station_data = station_data[(station_data['year'] >= start_year) & (station_data['year'] <= end_year)]
+
+            if station_data.empty:
+                 print(f"  Skipping {meta['station_id']}: No data in range.")
+                 continue
+
+            create_netcdf_file(meta['station_id'], event, meta, station_data, OUTPUT_DIR)
+        else:
+            print(f"  Skipping {meta['station_id']}: No sediment data found.")
+
+    # 6. Generate Summary CSV
+    print("[6/6] Generating summary CSV...")
+    generate_summary_csv(df, stations, SUMMARY_DIR)
+    
+    print("---"" Processing Complete ---")
+
+if __name__ == "__main__":
+    main()
