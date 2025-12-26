@@ -20,6 +20,25 @@ import netCDF4 as nc
 from datetime import datetime
 import os
 from pathlib import Path
+import sys
+import warnings
+warnings.filterwarnings('ignore')
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
+if PARENT_DIR not in sys.path:
+    sys.path.insert(0, PARENT_DIR)
+from tool import (
+    FILL_VALUE_FLOAT,
+    FILL_VALUE_INT,
+    apply_quality_flag,
+    compute_log_iqr_bounds,
+    build_ssc_q_envelope,
+    check_ssc_q_consistency,
+    plot_ssc_q_diagnostic,
+    convert_ssl_units_if_needed,
+    check_nc_completeness,
+    add_global_attributes
+)
 
 
 # ==========================================================
@@ -67,7 +86,7 @@ def parse_float(value):
 def read_csv_files():
     """读取 CSV 文件"""
     print("Reading CSV files...")
-    base_dir = Path("../../../Source/GFQA_v2/sed/")
+    base_dir = Path("/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/GFQA_v2/sed/")
 
     flux_df = pd.read_csv(f'{base_dir}/Flux.csv', delimiter=';', parse_dates=['Sample.Date'], encoding='iso-8859-1')
     water_df = pd.read_csv(f'{base_dir}/Water.csv', delimiter=';', parse_dates=['Sample.Date'], encoding='iso-8859-1')
@@ -222,9 +241,9 @@ def create_netcdf_file(station_id, station_row, dates,
     ):
         var = ds.createVariable(name, 'b', ('time',), fill_value=-127)
         var.long_name = f'quality flag for {desc}'
-        var.flag_values = np.array([0, 1, 2, 3], dtype=np.byte)
+        var.flag_values = np.array([0, 2, 3, 9], dtype=np.byte)
         var.flag_meanings = flag_meanings
-        var.comment = "0=good_data, 1=suspect_data, 2=bad_data, 3=missing_data"
+        var.comment = "good_data suspect_data bad_data missing_data"
         var[:] = values
 
     # 原始Data.Quality字符串变量
@@ -293,19 +312,76 @@ def process_all_stations(flux_df, water_df, station_df, output_dir):
             continue
 
         merged['SSL'] = merged['Clean_Value_Q'] * merged['Clean_Value_SSC'] * 0.0864
-        flag_meanings = "good_data suspect_data bad_data missing_data"
-        q_thresholds = {'negative': 0, 'extreme': 50000}
-        ssc_thresholds = {'negative': 0, 'extreme': 3000}
-        ssl_thresholds = {'negative': 0}
+        
+        #apply quality flags
+        merged['Q_flag'] = merged['Clean_Value_Q'].apply(
+            lambda x: apply_quality_flag(x, "Q")
+        )
 
-        merged['Q_flag'] = merged['Clean_Value_Q'].apply(lambda x: get_flag(x, q_thresholds, flag_meanings))
-        merged['SSC_flag'] = merged['Clean_Value_SSC'].apply(lambda x: get_flag(x, ssc_thresholds, flag_meanings))
-        merged['SSL_flag'] = merged['SSL'].apply(lambda x: get_flag(x, ssl_thresholds, flag_meanings))
+        merged['SSC_flag'] = merged['Clean_Value_SSC'].apply(
+            lambda x: apply_quality_flag(x, "SSC")
+        )
 
-        # === 收集所有站点的合并数据 ===
-        export_df = merged.copy()
-        export_df['Station_ID'] = station_id     # 加入站点号
-        all_records.append(export_df)
+        merged['SSL_flag'] = merged['SSL'].apply(
+            lambda x: apply_quality_flag(x, "SSL")
+        )
+
+        # === SSC-Q 一致性检查 ===
+        lower, upper = compute_log_iqr_bounds(merged['SSL'].values)
+
+        if lower is not None:
+            is_outlier = (
+                (merged['SSL'] < lower) |
+                (merged['SSL'] > upper)
+            ) & (merged['SSL_flag'] == 0)
+
+            merged.loc[is_outlier, 'SSL_flag'] = 2  # suspect
+
+        ssc_q_bounds = build_ssc_q_envelope(
+        Q_m3s=merged['Clean_Value_Q'].values,
+        SSC_mgL=merged['Clean_Value_SSC'].values,
+        k=1.5,
+        min_samples=5
+        )
+
+        for i, row in merged.iterrows():
+            is_bad, _ = check_ssc_q_consistency(
+                Q=row['Clean_Value_Q'],
+                SSC=row['Clean_Value_SSC'],
+                Q_flag=row['Q_flag'],
+                SSC_flag=row['SSC_flag'],
+                ssc_q_bounds=ssc_q_bounds
+            )
+            if is_bad:
+                merged.at[i, 'SSC_flag'] = 2  # suspect
+            
+        # --------------------------------------------------
+        # SSC–Q diagnostic plot (station-level)
+        # --------------------------------------------------
+        if ssc_q_bounds is not None:
+            plot_dir = Path(output_dir) / "diagnostic"
+            plot_dir.mkdir(exist_ok=True)
+
+            out_png = plot_dir / f"GFQA_{station_id}_ssc_q_diagnostic.png"
+
+            plot_ssc_q_diagnostic(
+                time=pd.to_datetime(merged['Date']).values,
+                Q=merged['Clean_Value_Q'].values,
+                SSC=merged['Clean_Value_SSC'].values,
+                Q_flag=merged['Q_flag'].values,
+                SSC_flag=merged['SSC_flag'].values,
+                ssc_q_bounds=ssc_q_bounds,
+                station_id=station_id,
+                station_name=str(station_row.get('Station Name', station_id)),
+                out_png=str(out_png),
+            )
+
+
+
+            # === 收集所有站点的合并数据 ===
+            export_df = merged.copy()
+            export_df['Station_ID'] = station_id     # 加入站点号
+            all_records.append(export_df)
 
         create_netcdf_file(
             station_id, station_row,
@@ -320,13 +396,30 @@ def process_all_stations(flux_df, water_df, station_df, output_dir):
             merged['Quality_SSC'].fillna('unknown').to_numpy(),
             output_dir
         )
+
+        # errors, warnings = check_nc_completeness(filepath, strict=False)
+
+        # if errors:
+        #     print("  ❌ NetCDF CF/ACDD compliance errors:")
+        #     for e in errors:
+        #         print(f"     - {e}")
+        #     raise RuntimeError("NetCDF completeness check failed")
+
+        # if warnings:
+        #     print("  ⚠️ NetCDF CF/ACDD compliance warnings:")
+        #     for w in warnings:
+        #         print(f"     - {w}")
+
     # === 所有站点合并输出 Excel ===
     if all_records:
         big_df = pd.concat(all_records, ignore_index=True)
-        out_dir = Path("output_check")
-        out_dir.mkdir(exist_ok=True)
+
+        out_dir = Path(output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
         out_path = out_dir / "GFQA_all_stations.xlsx"
         big_df.to_excel(out_path, index=False)
+
         print(f"\n📘 Saved merged Excel for all stations: {out_path}")
 
 
@@ -337,8 +430,12 @@ def main():
     print("=" * 60)
 
     flux_df, water_df, station_df = read_csv_files()
-    process_all_stations(flux_df, water_df, station_df, output_dir='daily_dual_qc')
-
+    
+    output_dir = (
+        "/share/home/dq134/wzx/sed_data/sediment_wzx_1111/"
+        "Output_r/daily/GFQA_v2/qc"
+    )
+    process_all_stations(flux_df, water_df, station_df, output_dir=output_dir)
     print("\nConversion complete with Data.Quality and QC Flags!")
 
 

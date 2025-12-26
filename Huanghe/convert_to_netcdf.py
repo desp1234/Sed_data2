@@ -337,9 +337,9 @@ def main():
     """Main conversion function."""
 
     # File paths
-    excel_file = '黄河流域泥沙观测数据.xlsx'
-    coord_file = '全国河流水文站坐标.xls'
-    output_dir = 'done'
+    excel_file = '/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/HuangHe/黄河流域泥沙观测数据.xlsx'
+    coord_file = '/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/HuangHe/全国河流水文站坐标.xls'
+    output_dir = '/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/HuangHe/netcdf/'
 
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)

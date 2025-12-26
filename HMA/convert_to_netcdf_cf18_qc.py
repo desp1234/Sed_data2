@@ -15,7 +15,24 @@ from netCDF4 import Dataset
 from datetime import datetime
 import os
 import re
-
+import sys
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
+if PARENT_DIR not in sys.path:
+    sys.path.insert(0, PARENT_DIR)
+from tool import (
+    FILL_VALUE_FLOAT,
+    FILL_VALUE_INT,
+    calculate_discharge,
+    apply_quality_flag,
+    compute_log_iqr_bounds,
+    build_ssc_q_envelope,
+    check_ssc_q_consistency,
+    plot_ssc_q_diagnostic,
+    # convert_ssl_units_if_needed,
+    check_nc_completeness,
+    add_global_attributes
+)
 
 def parse_period(period_str):
     """
@@ -143,60 +160,120 @@ def parse_value_with_uncertainty(value_str):
     return np.nan
 
 
-def apply_quality_checks(Q, SSC, SSL, sediment_yield):
+def apply_hma_climatology_qc(
+    Q,
+    SSC,
+    SSL,
+    time,
+    station_id,
+    station_name,
+    output_dir,
+    min_samples=5
+):
     """
-    Apply physical quality checks and assign flags
+    HMA climatological QC using tool.py logic, with explicit
+    statistical diagnostics and conditional SSC–Q plotting.
 
-    Flag values:
-    - 0: Good data
-    - 1: Estimated data
-    - 2: Suspect data (zero/extreme values)
-    - 3: Bad data (negative values)
-    - 9: Missing data
+    Parameters
+    ----------
+    Q, SSC, SSL : float
+        Climatological values
+    time : array-like of datetime
+        Time coordinate (length = number of samples)
+    station_id : str
+    station_name : str
+    output_dir : str
+        Base output directory
+    min_samples : int
+        Minimum samples required for statistical QC and plotting
 
-    Args:
-        Q: Discharge in m³/s
-        SSC: SSC in mg/L
-        SSL: Sediment load in ton/day
-        sediment_yield: Sediment yield in t/km²/yr
-
-    Returns:
-        tuple: (Q_flag, SSC_flag, SSL_flag)
+    Returns
+    -------
+    Q_flag, SSC_flag, SSL_flag : int
     """
-    Q_flag = 9  # Default: missing
-    SSC_flag = 9
-    SSL_flag = 9
 
-    # Check Q
-    if Q != -9999.0:
-        if Q < 0:
-            Q_flag = 3  # Bad: negative
-        elif Q == 0:
-            Q_flag = 2  # Suspect: zero flow
-        elif Q > 10000:  # Extreme high threshold for discharge
-            Q_flag = 2  # Suspect: extreme high
-        else:
-            Q_flag = 0  # Good
+    # ============================================================
+    # 1. Physical QC (always applied)
+    # ============================================================
+    Q_flag = apply_quality_flag(Q, "Q")
+    SSC_flag = apply_quality_flag(SSC, "SSC")
+    SSL_flag = apply_quality_flag(SSL, "SSL")
 
-    # Check SSC
-    if SSC != -9999.0:
-        if SSC < 0:
-            SSC_flag = 3  # Bad: negative
-        elif SSC < 0.1:
-            SSC_flag = 2  # Suspect: very low
-        elif SSC > 3000:  # Extreme high threshold
-            SSC_flag = 2  # Suspect: extreme high
-        else:
-            SSC_flag = 0  # Good
+    # ============================================================
+    # 2. Prepare arrays
+    # ============================================================
+    Q_arr = np.atleast_1d(Q).astype(float)
+    SSC_arr = np.atleast_1d(SSC).astype(float)
+    time_arr = np.atleast_1d(time)
 
-    # Check SSL
-    if SSL != -9999.0:
-        if SSL < 0:
-            SSL_flag = 3  # Bad: negative
-        elif SSL == 0:
-            SSL_flag = 2  # Suspect: zero load
-        else:
-            SSL_flag = 0  # Good
+    n = len(Q_arr)
+
+    # ============================================================
+    # 3. Log-IQR statistical QC (explicit decision)
+    # ============================================================
+    iqr_lower, iqr_upper = compute_log_iqr_bounds(SSC_arr)
+
+    if iqr_lower is None:
+        print(
+            f"  ℹ️  [{station_name}] "
+            f"Sample size = {n} < {min_samples}, "
+            "log-IQR statistical QC skipped."
+        )
+
+    # ============================================================
+    # 4. SSC–Q envelope & consistency
+    # ============================================================
+    ssc_q_bounds = build_ssc_q_envelope(
+        Q_arr, SSC_arr, min_samples=min_samples
+    )
+
+    if ssc_q_bounds is None:
+        print(
+            f"  ℹ️  [{station_name}] "
+            f"Sample size = {n} < {min_samples}, "
+            "SSC–Q consistency check and diagnostic plot skipped."
+        )
+    else:
+        # Consistency check (theoretically unreachable for climatology,
+        # but keeps logic unified with time-series workflow)
+        is_inconsistent, resid = check_ssc_q_consistency(
+            Q, SSC, Q_flag, SSC_flag, ssc_q_bounds
+        )
+
+        if is_inconsistent:
+            SSC_flag = np.int8(2)  # suspect
+            print(
+                f"  ⚠️  [{station_name}] "
+                "SSC–Q inconsistency detected (flag set to suspect)."
+            )
+
+        # ========================================================
+        # 5. SSC–Q diagnostic plot (only when statistics valid)
+        # ========================================================
+        diag_dir = os.path.join(output_dir, "qc_diagnostics")
+        os.makedirs(diag_dir, exist_ok=True)
+
+        out_png = os.path.join(
+            diag_dir,
+            f"{station_id}_ssc_q_diagnostic.png"
+        )
+
+        plot_ssc_q_diagnostic(
+            time=time_arr,
+            Q=Q_arr,
+            SSC=SSC_arr,
+            Q_flag=np.atleast_1d(Q_flag),
+            SSC_flag=np.atleast_1d(SSC_flag),
+            ssc_q_bounds=ssc_q_bounds,
+            station_id=station_id,
+            station_name=station_name,
+            out_png=out_png,
+        )
+
+        print(
+            f"  📈 [{station_name}] "
+            f"SSC–Q diagnostic plot saved: {out_png}"
+        )
 
     return Q_flag, SSC_flag, SSL_flag
 
@@ -293,9 +370,6 @@ def create_netcdf_for_station(station_data, output_dir, data_source_csv):
     # Calculate SSC
     SSC = calculate_SSC(SSL, Q)
 
-    # Apply quality checks
-    Q_flag, SSC_flag, SSL_flag = apply_quality_checks(Q, SSC, SSL, sediment_yield)
-
     # Skip if all data are missing
     if Q == -9999.0 and SSL == -9999.0:
         print(f"Warning: No valid Q or SSL data for {station_name}, skipping...")
@@ -307,6 +381,17 @@ def create_netcdf_for_station(station_data, output_dir, data_source_csv):
     mid_year = (start_year + end_year) // 2
     mid_date = datetime(mid_year, 7, 1)  # July 1st of mid-year
     days_since_1970 = (mid_date - reference_date).days
+
+    # Apply quality checks
+    Q_flag, SSC_flag, SSL_flag = apply_hma_climatology_qc(
+        Q=Q,
+        SSC=SSC,
+        SSL=SSL,
+        time=[mid_date],          # 👈 必须给
+        station_id=source_id,     # 👈 必须给
+        station_name=station_name,
+        output_dir=output_dir
+    )
 
     # Create NetCDF file
     nc = Dataset(filepath, 'w', format='NETCDF4')
@@ -503,6 +588,23 @@ def create_netcdf_for_station(station_data, output_dir, data_source_csv):
 
     nc.close()
 
+    # ============================================================
+    # CF-1.8 / ACDD-1.3 compliance check
+    # ============================================================
+    # errors, warnings = check_nc_completeness(filepath)
+
+    # if errors:
+    #     print("❌ CF/ACDD compliance FAILED:")
+    #     for e in errors:
+    #         print("   -", e)
+    #     raise RuntimeError("NetCDF compliance check failed")
+
+    # if warnings:
+    #     print("⚠️ CF/ACDD compliance warnings:")
+    #     for w in warnings:
+    #         print("   -", w)
+
+
     # Return summary
     return {
         'filename': filename,
@@ -583,8 +685,8 @@ def generate_station_summary_csv(summaries, output_dir):
 # Main processing
 if __name__ == '__main__':
     # Paths
-    source_csv = '/mnt/d/sediment_data/Source/HMA/HMA_catchments.csv'
-    output_dir = '/mnt/d/sediment_data/Script/Dataset/HMA/Output_r/'
+    source_csv = '/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/HMA/HMA_catchments.csv'
+    output_dir = '/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Output_r/annually_climatology/HMA/qc'
 
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)

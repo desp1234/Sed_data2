@@ -14,6 +14,24 @@ import numpy as np
 import netCDF4 as nc
 from datetime import datetime
 import warnings
+import sys
+# warnings.filterwarnings('ignore')
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
+if PARENT_DIR not in sys.path:
+    sys.path.insert(0, PARENT_DIR)
+from tool import (
+    FILL_VALUE_FLOAT,
+    FILL_VALUE_INT,
+    apply_quality_flag,
+    compute_log_iqr_bounds,
+    build_ssc_q_envelope,
+    check_ssc_q_consistency,
+    plot_ssc_q_diagnostic,
+    convert_ssl_units_if_needed,
+    check_nc_completeness,
+    add_global_attributes,
+)
 
 warnings.filterwarnings('ignore')
 
@@ -147,43 +165,54 @@ def perform_qc_checks(daily_df):
     """
     qc_df = daily_df.copy()
     
-    # Initialize flag variables
-    # Flag meanings: 0=good, 1=estimated, 2=suspect, 3=bad, 9=missing
-    qc_df['Q_flag'] = np.ones(len(qc_df), dtype=np.int8) * 0  # Default to good
-    qc_df['SSC_flag'] = np.ones(len(qc_df), dtype=np.int8) * 0
-    qc_df['SSL_flag'] = np.ones(len(qc_df), dtype=np.int8) * 0
-    
-    # Check for missing/NaN values
-    qc_df.loc[qc_df['discharge'].isna(), 'Q_flag'] = 9
-    qc_df.loc[qc_df['ssc'].isna(), 'SSC_flag'] = 9
-    qc_df.loc[qc_df['sediment_load'].isna(), 'SSL_flag'] = 9
-    
-    # Q (discharge) checks
-    # Q < 0: Bad data
-    qc_df.loc[(qc_df['discharge'] < 0) & (qc_df['Q_flag'] != 9), 'Q_flag'] = 3
-    
-    # Q == 0: Suspect data (could be real or error)
-    qc_df.loc[(qc_df['discharge'] == 0) & (qc_df['Q_flag'] == 0), 'Q_flag'] = 2
-    
-    # Q > 1000: Suspect (extreme high value) - set threshold for Niida River
-    # Based on data statistics (max ~504 m³/s), set threshold at 1000 m³/s
-    qc_df.loc[(qc_df['discharge'] > 1000) & (qc_df['Q_flag'] == 0), 'Q_flag'] = 2
-    
-    # SSC (suspended sediment concentration) checks
-    # SSC < 0.1 mg/L: Bad data (typically physical minimum)
-    qc_df.loc[(qc_df['ssc_mg_L'] < 0.1) & (qc_df['SSC_flag'] != 9), 'SSC_flag'] = 3
-    
-    # SSC > 3000 mg/L: Suspect (extreme high value)
-    qc_df.loc[(qc_df['ssc_mg_L'] > 3000) & (qc_df['SSC_flag'] == 0), 'SSC_flag'] = 2
-    
-    # SSC < 0: Bad data
-    qc_df.loc[(qc_df['ssc_mg_L'] < 0) & (qc_df['SSC_flag'] != 9), 'SSC_flag'] = 3
-    
-    # SSL (sediment load) checks
-    # SSL < 0: Bad data
-    qc_df.loc[(qc_df['sediment_load'] < 0) & (qc_df['SSL_flag'] != 9), 'SSL_flag'] = 3
-    
-    return qc_df
+    # -------------------------
+    # 1. Basic physical QC
+    # -------------------------
+    qc_df["Q_flag"] = qc_df["discharge"].apply(
+        lambda x: apply_quality_flag(x, "Q")
+    )
+    qc_df["SSC_flag"] = qc_df["ssc_mg_L"].apply(
+        lambda x: apply_quality_flag(x, "SSC")
+    )
+    qc_df["SSL_flag"] = qc_df["sediment_load"].apply(
+        lambda x: apply_quality_flag(x, "SSL")
+    )
+
+    # -------------------------
+    # 2. SSL log-IQR screening
+    # -------------------------
+    lower, upper = compute_log_iqr_bounds(qc_df["sediment_load"].values)
+
+    if lower is not None:
+        is_outlier = (
+            (qc_df["sediment_load"] < lower) |
+            (qc_df["sediment_load"] > upper)
+        ) & (qc_df["SSL_flag"] == 0)
+
+        qc_df.loc[is_outlier, "SSL_flag"] = 2  # suspect
+
+    # -------------------------
+    # 3. SSC–Q consistency check
+    # -------------------------
+    ssc_q_bounds = build_ssc_q_envelope(
+        Q_m3s=qc_df["discharge"].values,
+        SSC_mgL=qc_df["ssc_mg_L"].values,
+        k=1.5,
+        min_samples=5
+    )
+
+    for i, row in qc_df.iterrows():
+        is_bad, _ = check_ssc_q_consistency(
+            Q=row["discharge"],
+            SSC=row["ssc_mg_L"],
+            Q_flag=row["Q_flag"],
+            SSC_flag=row["SSC_flag"],
+            ssc_q_bounds=ssc_q_bounds
+        )
+        if is_bad:
+            qc_df.at[i, "SSC_flag"] = 2  # suspect
+
+    return qc_df, ssc_q_bounds
 
 
 def create_netcdf_cf18(filepath, data, station_name, river_name, source_id=None):
@@ -223,10 +252,14 @@ def create_netcdf_cf18(filepath, data, station_name, river_name, source_id=None)
     time_var.axis = 'T'
     
     # Convert dates to days since epoch
-    reference_date = pd.Timestamp(data["datetime"].min().strftime("%Y-%m-%d"))
-    time_values = [(d - reference_date).total_seconds() / 86400.0
-                   for d in data['datetime']]
-    time_var[:] = time_values
+    ref = pd.to_datetime(data["datetime"].min().date())
+
+    time_var.units = f"days since {ref.strftime('%Y-%m-%d')} 00:00:00"
+    time_var.calendar = "gregorian"
+
+    time_var[:] = (data["datetime"].dt.floor("D") - ref).dt.days.values
+
+
     
     # Create scalar coordinate variables
     lat_var = dataset.createVariable('lat', 'f4')
@@ -243,22 +276,22 @@ def create_netcdf_cf18(filepath, data, station_name, river_name, source_id=None)
     lon_var.valid_range = np.array([-180.0, 180.0], dtype='f4')
     lon_var[:] = lon
     
-    alt_var = dataset.createVariable('altitude', 'f4')
-    alt_var.standard_name = 'altitude'
-    alt_var.long_name = 'station elevation above sea level'
-    alt_var.units = 'm'
-    alt_var.positive = 'up'
-    alt_var._FillValue = -9999.0
-    alt_var.comment = f'Sampling depth: {depth} m below surface. Negative values indicate below water surface.'
-    alt_var[:] = -depth  # Negative for below surface
+    # alt_var = dataset.createVariable('altitude', 'f4')
+    # alt_var.standard_name = 'altitude'
+    # alt_var.long_name = 'station elevation above sea level'
+    # alt_var.units = 'm'
+    # alt_var.positive = 'up'
+    # alt_var._FillValue = -9999.0
+    # alt_var.comment = f'Sampling depth: {depth} m below surface. Negative values indicate below water surface.'
+    # alt_var[:] = -depth  # Negative for below surface
     
-    area_var = dataset.createVariable('upstream_area', 'f4')
-    area_var.long_name = 'upstream drainage area'
-    area_var.standard_name = 'upstream_area'
-    area_var.units = 'km2'
-    area_var._FillValue = -9999.0
-    area_var.comment = 'Not available in source data'
-    area_var[:] = -9999.0
+    # area_var = dataset.createVariable('upstream_area', 'f4')
+    # area_var.long_name = 'upstream drainage area'
+    # area_var.standard_name = 'upstream_area'
+    # area_var.units = 'km2'
+    # # area_var._FillValue = -9999.0
+    # area_var.comment = 'Not available in source data'
+    # area_var[:] = -9999.0
     
     # Create data variables with quality flags
     # Q (discharge)
@@ -266,13 +299,13 @@ def create_netcdf_cf18(filepath, data, station_name, river_name, source_id=None)
     Q_var.standard_name = 'water_volume_transport_in_river_channel'
     Q_var.long_name = 'river discharge'
     Q_var.units = 'm3 s-1'
-    Q_var.coordinates = 'time lat lon'
+    Q_var.coordinates = 'lat lon'
     Q_var.ancillary_variables = 'Q_flag'
     Q_var.comment = f'Source: Original data provided by Feng et al. (2022, DOI:10.34355/CRiED.U.Tsukuba.00147). Unit: m³/s (cubic meters per second).'
     Q_var[:] = data['discharge'].fillna(-9999.0).values
     
     # Q_flag
-    Q_flag_var = dataset.createVariable('Q_flag', 'i1', ('time',), fill_value=9)
+    Q_flag_var = dataset.createVariable('Q_flag', 'i1', ('time',), fill_value=FILL_VALUE_INT)
     Q_flag_var.long_name = 'quality flag for river discharge'
     Q_flag_var.standard_name = 'status_flag'
     Q_flag_var.flag_values = np.array([0, 1, 2, 3, 9], dtype=np.int8)
@@ -285,13 +318,13 @@ def create_netcdf_cf18(filepath, data, station_name, river_name, source_id=None)
     SSC_var.standard_name = 'mass_concentration_of_suspended_matter_in_water'
     SSC_var.long_name = 'suspended sediment concentration'
     SSC_var.units = 'mg L-1'
-    SSC_var.coordinates = 'time lat lon'
+    SSC_var.coordinates = 'lat lon'
     SSC_var.ancillary_variables = 'SSC_flag'
     SSC_var.comment = 'Source: Original data provided by Feng et al. (2022, DOI:10.34355/CRiED.U.Tsukuba.00147). Unit conversion: multiplied by 1000 to convert from g/L to mg/L.'
     SSC_var[:] = data['ssc_mg_L'].fillna(-9999.0).values
     
     # SSC_flag
-    SSC_flag_var = dataset.createVariable('SSC_flag', 'i1', ('time',), fill_value=9)
+    SSC_flag_var = dataset.createVariable('SSC_flag', 'i1', ('time',), fill_value=FILL_VALUE_INT)
     SSC_flag_var.long_name = 'quality flag for suspended sediment concentration'
     SSC_flag_var.standard_name = 'status_flag'
     SSC_flag_var.flag_values = np.array([0, 1, 2, 3, 9], dtype=np.int8)
@@ -303,13 +336,13 @@ def create_netcdf_cf18(filepath, data, station_name, river_name, source_id=None)
     SSL_var = dataset.createVariable('SSL', 'f4', ('time',), fill_value=-9999.0, zlib=True, complevel=4)
     SSL_var.long_name = 'suspended sediment load'
     SSL_var.units = 'ton day-1'
-    SSL_var.coordinates = 'time lat lon'
+    SSL_var.coordinates = 'lat lon'
     SSL_var.ancillary_variables = 'SSL_flag'
     SSL_var.comment = 'Source: Calculated. Formula: SSL (ton/day) = Q (m³/s) × SSC (g/L) × 86.4, where 86.4 = 86400 s/day / 1000 L/m³ / 1000 kg/ton. Represents daily average.'
     SSL_var[:] = data['sediment_load'].fillna(-9999.0).values
     
     # SSL_flag
-    SSL_flag_var = dataset.createVariable('SSL_flag', 'i1', ('time',), fill_value=9)
+    SSL_flag_var = dataset.createVariable('SSL_flag', 'i1', ('time',), fill_value=FILL_VALUE_INT)
     SSL_flag_var.long_name = 'quality flag for suspended sediment load'
     SSL_flag_var.standard_name = 'status_flag'
     SSL_flag_var.flag_values = np.array([0, 1, 2, 3, 9], dtype=np.int8)
@@ -328,6 +361,12 @@ def create_netcdf_cf18(filepath, data, station_name, river_name, source_id=None)
     
     dataset.source = 'In-situ station data'
     dataset.data_source_name = 'Fukushima Niida River Dataset'
+
+    dataset.comment_auxiliary_variables = (
+    "Station altitude and upstream drainage area are not included in the current "
+    "version due to lack of reliable source information. These variables will be "
+    "added in future releases when available."
+    )
     
     # Station information
     dataset.station_name = station_name
@@ -350,7 +389,7 @@ def create_netcdf_cf18(filepath, data, station_name, river_name, source_id=None)
     dataset.time_coverage_start = time_start
     dataset.time_coverage_end = time_end
     dataset.Temporal_Resolution = 'daily'
-    dataset.Variables_Provided = 'Q, SSC, SSL, altitude, upstream_area'
+    dataset.Variables_Provided = 'Q, SSC, SSL'
     
     # References and provenance
     dataset.references = 'DOI: 10.34355/CRiED.U.Tsukuba.00147'
@@ -384,9 +423,9 @@ def process_fukushima_data():
     """Main processing function for Fukushima Niida River data."""
     
     # File paths
-    base_dir = '/Users/zhongwangwei/Downloads/Sediment/Source/Fukushima'
+    base_dir = '/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/Fukushima/'
     data_file = os.path.join(base_dir, 'DOI00147_data.xls')
-    output_dir = '/Users/zhongwangwei/Downloads/Sediment/Output_r/daily/Fukushima'
+    output_dir = '/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Output_r/daily/Fukushima/qc/'
     
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
@@ -423,7 +462,7 @@ def process_fukushima_data():
         print(f"  Daily records: {len(daily_data)}")
         
         # Perform QC checks
-        qc_data = perform_qc_checks(daily_data)
+        qc_data, ssc_q_bounds = perform_qc_checks(daily_data)
         
         # Count good data
         Q_good = (qc_data['Q_flag'] == 0).sum()
@@ -438,16 +477,60 @@ def process_fukushima_data():
         print(f"    Q: {Q_good}/{len(qc_data)} ({Q_pct:.1f}%)")
         print(f"    SSC: {SSC_good}/{len(qc_data)} ({SSC_pct:.1f}%)")
         print(f"    SSL: {SSL_good}/{len(qc_data)} ({SSL_pct:.1f}%)")
-        
+
+
         # Create source ID
         safe_name = station_name.replace(' ', '_').replace('/', '_')
         source_id = f"DOI00147_{safe_name}"
         
+        # --------------------------------------------------
+        # SSC–Q diagnostic plot (station-level)
+        # --------------------------------------------------
+        if ssc_q_bounds is not None:
+            diag_dir = os.path.join(output_dir, "ssc_q_diagnostic")
+            os.makedirs(diag_dir, exist_ok=True)
+
+            diag_png = os.path.join(
+                diag_dir,
+                f"Fukushima_{safe_name}_ssc_q_diagnostic.png"
+            )
+
+            plot_ssc_q_diagnostic(
+                time=qc_data["datetime"].values,
+                Q=qc_data["discharge"].values,
+                SSC=qc_data["ssc_mg_L"].values,
+                Q_flag=qc_data["Q_flag"].values,
+                SSC_flag=qc_data["SSC_flag"].values,
+                ssc_q_bounds=ssc_q_bounds,
+                station_id=source_id,
+                station_name=station_name,
+                out_png=diag_png,
+            )
+
+
         # Create NetCDF file
         output_file = os.path.join(output_dir, f"Fukushima_{safe_name}.nc")
         
         try:
             create_netcdf_cf18(output_file, qc_data, station_name, 'Niida River', source_id)
+
+        # -----------------------------------------------
+        # CF-1.8 / ACDD-1.3 completeness check
+        # -----------------------------------------------
+        # errors, warnings = check_nc_completeness(output_file)
+
+        # if errors:
+        #     print("  ❌ CF/ACDD compliance FAILED:")
+        #     for e in errors:
+        #         print(f"     - {e}")
+        #     raise RuntimeError("NetCDF compliance check failed")
+
+        # if warnings:
+        #     print("  ⚠️ CF/ACDD compliance warnings:")
+        #     for w in warnings:
+        #         print(f"     - {w}")
+
+
             print(f"  Created: {output_file}")
             success_count += 1
             

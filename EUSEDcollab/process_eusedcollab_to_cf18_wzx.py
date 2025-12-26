@@ -30,31 +30,43 @@ import netCDF4 as nc
 from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
+if PARENT_DIR not in sys.path:
+    sys.path.insert(0, PARENT_DIR)
+from tool import (
+    FILL_VALUE_FLOAT,
+    FILL_VALUE_INT,
+    apply_quality_flag,
+    compute_log_iqr_bounds,
+    build_ssc_q_envelope,
+    check_ssc_q_consistency,
+    plot_ssc_q_diagnostic,
+    convert_ssl_units_if_needed,
+    check_nc_completeness,
+    add_global_attributes
+)
+
 
 # =============================================================================
 # Configuration
 # =============================================================================
 
 # Data paths
-SOURCE_DIR = '/Users/guizijin/DATA/sediment_data/EUSEDcollab/'
-OUTPUT_DIR = '/Users/guizijin/DATA/sediment_data/EUSEDcollab/output/'
+SOURCE_DIR = '/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/EUSEDcollab/'
+OUTPUT_DIR = '/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Output_r/monthly/EUSEDcollab/qc'
 METADATA_FILE = os.path.join(SOURCE_DIR, 'ALL_METADATA.csv')
 
-# Quality flag definitions
-FLAG_GOOD = 0        # Good data
-FLAG_ESTIMATED = 1   # Estimated data
-FLAG_SUSPECT = 2     # Suspect data (e.g., zero/extreme values)
-FLAG_BAD = 3         # Bad data (e.g., negative values)
-FLAG_MISSING = 9     # Missing in source
-
-# Physical thresholds for quality control
-Q_MIN = 0.0           # m³/s, values < 0 are bad
-Q_EXTREME = 10000.0   # m³/s, values > this are suspect
-SSC_MIN = 0.0         # mg/L, values < 0 are bad
-SSC_EXTREME = 3000.0  # mg/L, values > this are suspect (3 g/ml as per requirements)
-SSL_MIN = 0.0         # ton/day, values < 0 are bad
 
 FILL_VALUE = -9999.0
+# =============================================================================
+# QC flag definitions (consistent with tool.py)
+# =============================================================================
+FLAG_GOOD = np.int8(0)
+FLAG_ESTIMATED = np.int8(1)
+FLAG_SUSPECT = np.int8(2)
+FLAG_BAD = np.int8(3)
+FLAG_MISSING = np.int8(9)
 
 # =============================================================================
 # Helper Functions
@@ -174,55 +186,6 @@ def parse_date_flexible(date_str):
         return None
 
 
-def create_quality_flag(data, variable_name):
-    """
-    Create quality flag array based on physical constraints
-
-    Parameters:
-    -----------
-    data : array-like
-        Data values
-    variable_name : str
-        Variable name ('Q', 'SSC', or 'SSL')
-
-    Returns:
-    --------
-    flags : numpy array (byte)
-        Quality flags (0=good, 1=estimated, 2=suspect, 3=bad, 9=missing)
-    """
-    flags = np.full(len(data), FLAG_MISSING, dtype=np.byte)
-
-    for i, val in enumerate(data):
-        if pd.isna(val) or val == FILL_VALUE:
-            flags[i] = FLAG_MISSING
-            continue
-
-        if variable_name == 'Q':
-            if val < Q_MIN:
-                flags[i] = FLAG_BAD  # Negative discharge
-            elif val == 0.0:
-                flags[i] = FLAG_SUSPECT  # Zero flow (may be real, but suspect)
-            elif val > Q_EXTREME:
-                flags[i] = FLAG_SUSPECT  # Extremely high flow
-            else:
-                flags[i] = FLAG_GOOD
-
-        elif variable_name == 'SSC':
-            if val < SSC_MIN:
-                flags[i] = FLAG_BAD  # Negative concentration
-            elif val > SSC_EXTREME:
-                flags[i] = FLAG_SUSPECT  # Extremely high concentration
-            else:
-                flags[i] = FLAG_GOOD
-
-        elif variable_name == 'SSL':
-            if val < SSL_MIN:
-                flags[i] = FLAG_BAD  # Negative load
-            else:
-                flags[i] = FLAG_GOOD
-
-    return flags
-
 
 def trim_to_valid_data(df, date_col='date'):
     """
@@ -247,16 +210,158 @@ def trim_to_valid_data(df, date_col='date'):
 
     return df_trimmed
 
+def _to_float_array(x):
+    """Safe float array conversion; keeps NaN for missing, not FillValue."""
+    arr = pd.to_numeric(pd.Series(x), errors="coerce").to_numpy(dtype=float)
+    return arr
 
-def calculate_data_completeness(data, flags):
-    """Calculate percentage of good data (flag=0)"""
-    total_count = len(data)
-    if total_count == 0:
+
+def _mask_valid_positive(arr):
+    arr = np.asarray(arr, dtype=float)
+    return np.isfinite(arr) & (arr > 0)
+
+
+def qc_with_toolpy(
+    df,
+    station_id,
+    station_name,
+    diagnostic_dir=None,
+    iqr_k=1.5,
+    min_samples_envelope=5,
+    flag_estimated_mask=None,
+    ):
+    """
+    Apply QC using tool.py functions:
+    1) apply_quality_flag (missing / negative)
+    2) log-IQR bounds -> flag suspect (2) for SSC/SSL outliers (optionally Q too)
+    3) SSC–Q envelope consistency -> flag suspect (2) for inconsistent SSC
+    4) optional diagnostic plot
+
+    Parameters
+    ----------
+    df : DataFrame with columns: date, Q, SSC, SSL (values may be FillValue)
+    flag_estimated_mask : dict or None
+        e.g. {"SSC": boolean array} to preset some points as estimated (1)
+        (useful when SSC comes from turbidity conversion)
+
+    Returns
+    -------
+    df_out : DataFrame with added columns Q_flag, SSC_flag, SSL_flag, ssc_q_resid
+    ssc_q_bounds : dict or None
+    """
+
+    out = df.copy()
+
+    # Turn FillValue to NaN for QC logic
+    for v in ["Q", "SSC", "SSL"]:
+        if v in out.columns:
+            out[v] = pd.to_numeric(out[v], errors="coerce")
+            out.loc[out[v] == float(FILL_VALUE_FLOAT), v] = np.nan
+            out.loc[out[v] == -9999.0, v] = np.nan  #兼容你脚本里 FILL_VALUE
+
+    Q = _to_float_array(out["Q"])
+    SSC = _to_float_array(out["SSC"])
+    SSL = _to_float_array(out["SSL"])
+
+    # ----------------------------
+    # 1) Base physical flags
+    # ----------------------------
+    Q_flag = np.array([apply_quality_flag(v, "Q") for v in Q], dtype=np.int8)
+    SSC_flag = np.array([apply_quality_flag(v, "SSC") for v in SSC], dtype=np.int8)
+    SSL_flag = np.array([apply_quality_flag(v, "SSL") for v in SSL], dtype=np.int8)
+
+    # Optional: preset estimated flags (e.g. turbidity-derived SSC)
+    if flag_estimated_mask:
+        for var, mask in flag_estimated_mask.items():
+            mask = np.asarray(mask, dtype=bool)
+            if var == "SSC":
+                SSC_flag = np.where(mask & (SSC_flag == 0), np.int8(1), SSC_flag)
+            if var == "Q":
+                Q_flag = np.where(mask & (Q_flag == 0), np.int8(1), Q_flag)
+            if var == "SSL":
+                SSL_flag = np.where(mask & (SSL_flag == 0), np.int8(1), SSL_flag)
+
+    # ----------------------------
+    # 2) log-IQR outlier screening (suspect=2)
+    #    仅对“观测量”更合理；这里默认对 SSC/SSL 做
+    # ----------------------------
+    ssc_lb, ssc_ub = compute_log_iqr_bounds(SSC, k=iqr_k)
+    if ssc_lb is not None:
+        bad = np.isfinite(SSC) & (SSC > 0) & ((SSC < ssc_lb) | (SSC > ssc_ub))
+        SSC_flag = np.where(bad & (SSC_flag == 0), np.int8(2), SSC_flag)
+
+    ssl_lb, ssl_ub = compute_log_iqr_bounds(SSL, k=iqr_k)
+    if ssl_lb is not None:
+        bad = np.isfinite(SSL) & (SSL > 0) & ((SSL < ssl_lb) | (SSL > ssl_ub))
+        SSL_flag = np.where(bad & (SSL_flag == 0), np.int8(2), SSL_flag)
+
+    # （可选）若你也想对 Q 做 IQR，可以打开这段
+    # q_lb, q_ub = compute_log_iqr_bounds(Q, k=iqr_k)
+    # if q_lb is not None:
+    #     bad = np.isfinite(Q) & (Q > 0) & ((Q < q_lb) | (Q > q_ub))
+    #     Q_flag = np.where(bad & (Q_flag == 0), np.int8(2), Q_flag)
+
+    # ----------------------------
+    # 3) SSC–Q envelope consistency
+    # ----------------------------
+    ssc_q_bounds = build_ssc_q_envelope(
+        Q_m3s=Q,
+        SSC_mgL=SSC,
+        k=iqr_k,
+        min_samples=min_samples_envelope
+    )
+
+    resid_arr = np.full(len(out), np.nan, dtype=float)
+    if ssc_q_bounds is not None:
+        for i in range(len(out)):
+            inconsistent, resid = check_ssc_q_consistency(
+                Q=Q[i], SSC=SSC[i],
+                Q_flag=Q_flag[i], SSC_flag=SSC_flag[i],
+                ssc_q_bounds=ssc_q_bounds
+            )
+            resid_arr[i] = resid
+            if inconsistent and SSC_flag[i] == 0:
+                SSC_flag[i] = np.int8(2)
+                # 如果你希望 SSL 也跟着变成 suspect，可以打开：
+                # if SSL_flag[i] == 0 and np.isfinite(SSL[i]) and SSL[i] > 0:
+                #     SSL_flag[i] = np.int8(2)
+
+    # ----------------------------
+    # 4) write back
+    # ----------------------------
+    out["Q_flag"] = Q_flag.astype(np.int8)
+    out["SSC_flag"] = SSC_flag.astype(np.int8)
+    out["SSL_flag"] = SSL_flag.astype(np.int8)
+    out["ssc_q_resid"] = resid_arr
+
+    # ----------------------------
+    # 5) diagnostic plot
+    # ----------------------------
+    if diagnostic_dir is not None:
+        os.makedirs(diagnostic_dir, exist_ok=True)
+        out_png = os.path.join(diagnostic_dir, f"EUSEDcollab_{station_id}_{station_name}_ssc_q.png")
+        try:
+            plot_ssc_q_diagnostic(
+                time=out["date"].to_numpy(),
+                Q=Q,
+                SSC=SSC,
+                Q_flag=Q_flag,
+                SSC_flag=SSC_flag,
+                ssc_q_bounds=ssc_q_bounds,
+                station_id=str(station_id),
+                station_name=str(station_name),
+                out_png=out_png
+            )
+        except Exception as e:
+            print(f"  Warning: diagnostic plot failed: {e}")
+
+    return out, ssc_q_bounds
+    
+def calculate_data_completeness_from_flag(flag_arr):
+    flag_arr = np.asarray(flag_arr, dtype=np.int8)
+    if flag_arr.size == 0:
         return 0.0
-
-    good_count = np.sum(flags == FLAG_GOOD)
-    return (good_count / total_count) * 100.0
-
+    return float(np.sum(flag_arr == 0) / flag_arr.size * 100.0)
 
 # =============================================================================
 # Main Processing Functions
@@ -371,24 +476,33 @@ def read_station_data(station_id, country):
     # ----------------------------------------------------
     # NEW STEP: Fill missing Q / SSC / SSL using SSL = Q * SSC * 0.0864
     # ----------------------------------------------------
-    # Only operate on clean numeric values
+    # ----------------------------------------------------
+    # NEW STEP: Fill missing Q / SSC / SSL using SSL = Q * SSC * 0.0864
+    # ----------------------------------------------------
     df['Q'] = pd.to_numeric(df['Q'], errors='coerce')
     df['SSC'] = pd.to_numeric(df['SSC'], errors='coerce')
     df['SSL'] = pd.to_numeric(df['SSL'], errors='coerce')
 
-    factor = 0.0864  # given coefficient
+    factor = 0.0864
+
+    # 记录哪些点是“派生得到的”
+    derived_mask = np.zeros(len(df), dtype=bool)
 
     # Case 1: SSL missing → compute from Q and SSC
     mask = df['SSL'].isna() & df['Q'].notna() & df['SSC'].notna()
     df.loc[mask, 'SSL'] = df.loc[mask, 'Q'] * df.loc[mask, 'SSC'] * factor
+    derived_mask |= mask.to_numpy()
 
     # Case 2: SSC missing → compute from Q and SSL
     mask = df['SSC'].isna() & df['Q'].notna() & df['SSL'].notna()
     df.loc[mask, 'SSC'] = df.loc[mask, 'SSL'] / (df.loc[mask, 'Q'] * factor)
+    derived_mask |= mask.to_numpy()
 
     # Case 3: Q missing → compute from SSC and SSL
     mask = df['Q'].isna() & df['SSC'].notna() & df['SSL'].notna()
     df.loc[mask, 'Q'] = df.loc[mask, 'SSL'] / (df.loc[mask, 'SSC'] * factor)
+    derived_mask |= mask.to_numpy()
+
 
     # ----------------------------------------------------
     # 4) Replace NaN with Fill Value
@@ -397,7 +511,9 @@ def read_station_data(station_id, country):
         if col in df.columns:
             df[col] = df[col].replace([np.inf, -np.inf], np.nan).fillna(FILL_VALUE)
 
-    return df[['date', 'Q', 'SSC', 'SSL']]
+    df["derived"] = derived_mask
+    return df[['date', 'Q', 'SSC', 'SSL', 'derived']]
+
 
 
 def process_station(station_id, country):
@@ -429,15 +545,40 @@ def process_station(station_id, country):
         print(f"  Skipping: No valid data after trimming")
         return None
 
-    # Create quality flags
-    q_flag = create_quality_flag(df['Q'].values, 'Q')
-    ssc_flag = create_quality_flag(df['SSC'].values, 'SSC')
-    ssl_flag = create_quality_flag(df['SSL'].values, 'SSL')
+    # ------------------------------------------
+    # QC using tool.py
+    # ------------------------------------------
+    DIAG_DIR = os.path.join(OUTPUT_DIR, "diagnostic")
+    # 如果你想把 turbidity-derived SSC 标为 estimated(1)，可以传 mask：
+    # estimated_mask = {"SSC": (df.get("SSC_flag", 0) == FLAG_ESTIMATED)}  # 你目前 detect_and_convert_columns 有写 SSC_flag=FLAG_ESTIMATED
+    estimated_mask = {
+    "Q": df["derived"].values,
+    "SSC": df["derived"].values,
+    "SSL": df["derived"].values,
+    }
+
+
+    df_qc, ssc_q_bounds = qc_with_toolpy(
+        df=df,
+        station_id=station_id,
+        station_name=metadata["station_name"],
+        diagnostic_dir=DIAG_DIR,
+        iqr_k=1.5,
+        min_samples_envelope=5,
+        flag_estimated_mask=estimated_mask
+    )
+
+    q_flag = df_qc["Q_flag"].to_numpy(dtype=np.int8)
+    ssc_flag = df_qc["SSC_flag"].to_numpy(dtype=np.int8)
+    ssl_flag = df_qc["SSL_flag"].to_numpy(dtype=np.int8)
+
+    # 覆盖 df，后面写 nc 用 QC 后的数据（注意：df_qc 里仍是 NaN；写 nc 前会转 FillValue）
+    df = df_qc
 
     # Calculate data completeness
-    q_completeness = calculate_data_completeness(df['Q'].values, q_flag)
-    ssc_completeness = calculate_data_completeness(df['SSC'].values, ssc_flag)
-    ssl_completeness = calculate_data_completeness(df['SSL'].values, ssl_flag)
+    q_completeness = calculate_data_completeness_from_flag(q_flag)
+    ssc_completeness = calculate_data_completeness_from_flag(ssc_flag)
+    ssl_completeness = calculate_data_completeness_from_flag(ssl_flag)
 
     # Get date range
     start_date = df['date'].min()
@@ -449,9 +590,50 @@ def process_station(station_id, country):
     print(f"  SSC completeness: {ssc_completeness:.1f}%")
     print(f"  SSL completeness: {ssl_completeness:.1f}%")
 
+    # --------------------------------------------------
+    # SSC–Q diagnostic plot
+    # --------------------------------------------------
+    plot_dir = os.path.join(OUTPUT_DIR, "diagnostic_plots")
+    os.makedirs(plot_dir, exist_ok=True)
+
+    plot_file = os.path.join(
+        plot_dir,
+        f"EUSEDcollab_{country}-{metadata['station_name']}-ID{station_id}_ssc_q.png"
+    )
+
+    plot_ssc_q_diagnostic(
+        time=df['date'].values,
+        Q=df['Q'].values,
+        SSC=df['SSC'].values,
+        Q_flag=q_flag,
+        SSC_flag=ssc_flag,
+        ssc_q_bounds=ssc_q_bounds,
+        station_id=str(station_id),
+        station_name=metadata['station_name'],
+        out_png=plot_file,
+    )
+
+
     # Create NetCDF file
     output_file = os.path.join(OUTPUT_DIR, f'EUSEDcollab_{country}-{metadata["station_name"]}-ID{station_id}.nc')
     write_netcdf(df, metadata, q_flag, ssc_flag, ssl_flag, output_file)
+
+     # ---------------------------------------------------------
+    # Post-write CF-1.8 / ACDD-1.3 compliance check
+    # ---------------------------------------------------------
+    # errors, warnings = check_nc_completeness(output_file)
+
+    # if errors:
+    #     print("  ❌ CF/ACDD compliance FAILED:")
+    #     for e in errors:
+    #         print("     -", e)
+    #     raise RuntimeError("NetCDF compliance check failed")
+
+    # if warnings:
+    #     print("  ⚠️ CF/ACDD compliance warnings:")
+    #     for w in warnings:
+    #         print("     -", w)
+
 
     # Return station summary
     station_info = {
@@ -533,7 +715,7 @@ def write_netcdf(df, metadata, q_flag, ssc_flag, ssl_flag, output_file):
         lon_var[:] = metadata['longitude']
 
         # Altitude (scalar) - not available in metadata
-        alt_var = ds.createVariable('altitude', 'f4', fill_value=FILL_VALUE)
+        alt_var = ds.createVariable('altitude', 'f4', fill_value=FILL_VALUE_FLOAT)
         alt_var.standard_name = 'altitude'
         alt_var.long_name = 'station elevation above sea level'
         alt_var.units = 'm'
@@ -542,7 +724,7 @@ def write_netcdf(df, metadata, q_flag, ssc_flag, ssl_flag, output_file):
         alt_var[:] = FILL_VALUE
 
         # Upstream area (scalar)
-        area_var = ds.createVariable('upstream_area', 'f4', fill_value=FILL_VALUE)
+        area_var = ds.createVariable('upstream_area', 'f4', fill_value=FILL_VALUE_FLOAT)
         area_var.long_name = 'upstream drainage area'
         area_var.units = 'km2'
         area_var.comment = 'Source: Original data provided by EUSEDcollab. Converted from hectares.'
@@ -554,9 +736,16 @@ def write_netcdf(df, metadata, q_flag, ssc_flag, ssl_flag, output_file):
         # =================================================================
         # Data Variables
         # =================================================================
+        q_data = pd.to_numeric(df['Q'], errors='coerce').to_numpy(dtype=np.float32)
+        ssc_data = pd.to_numeric(df['SSC'], errors='coerce').to_numpy(dtype=np.float32)
+        ssl_data = pd.to_numeric(df['SSL'], errors='coerce').to_numpy(dtype=np.float32)
+
+        q_data[~np.isfinite(q_data)] = FILL_VALUE_FLOAT
+        ssc_data[~np.isfinite(ssc_data)] = FILL_VALUE_FLOAT
+        ssl_data[~np.isfinite(ssl_data)] = FILL_VALUE_FLOAT
 
         # Q (Discharge)
-        q_var = ds.createVariable('Q', 'f4', ('time',), fill_value=FILL_VALUE)
+        q_var = ds.createVariable('Q', 'f4', ('time',), fill_value=FILL_VALUE_FLOAT)
         q_var.standard_name = 'water_volume_transport_in_river_channel'
         q_var.long_name = 'river discharge'
         q_var.units = 'm3 s-1'
@@ -568,19 +757,19 @@ def write_netcdf(df, metadata, q_flag, ssc_flag, ssl_flag, output_file):
             q_var.comment = 'Source: Original data provided by EUSEDcollab. Event data converted to daily rates: Q (m³/event) divided by event duration (days) and 86400 s/day.'
         else:
             q_var.comment = 'Source: Original data provided by EUSEDcollab. Units converted from m³/day to m³/s (÷ 86400).'
-        q_var[:] = df['Q'].values
+        q_var[:] = q_data
 
         # Q flag
-        q_flag_var = ds.createVariable('Q_flag', 'b', ('time',), fill_value=FLAG_MISSING)
+        q_flag_var = ds.createVariable('Q_flag', 'b', ('time',), fill_value=FILL_VALUE_INT)
         q_flag_var.long_name = 'quality flag for river discharge'
         q_flag_var.standard_name = 'status_flag'
-        q_flag_var.flag_values = np.array([0, 1, 2, 3, 9], dtype=np.byte)
+        q_flag_var.flag_values = np.array([0, 1, 2, 3, 9], dtype=np.int8)
         q_flag_var.flag_meanings = 'good_data estimated_data suspect_data bad_data missing_data'
         q_flag_var.comment = 'Flag definitions: 0=Good, 1=Estimated, 2=Suspect (e.g., zero/extreme), 3=Bad (e.g., negative), 9=Missing in source.'
         q_flag_var[:] = q_flag
 
         # SSC (Suspended Sediment Concentration)
-        ssc_var = ds.createVariable('SSC', 'f4', ('time',), fill_value=FILL_VALUE)
+        ssc_var = ds.createVariable('SSC', 'f4', ('time',), fill_value=FILL_VALUE_FLOAT)
         ssc_var.standard_name = 'mass_concentration_of_suspended_matter_in_water'
         ssc_var.long_name = 'suspended sediment concentration'
         ssc_var.units = 'mg L-1'
@@ -589,10 +778,10 @@ def write_netcdf(df, metadata, q_flag, ssc_flag, ssl_flag, output_file):
 
         # Comment is same for both event and daily data (concentration doesn't need temporal conversion)
         ssc_var.comment = 'Source: Original data provided by EUSEDcollab. Units converted from kg/m³ to mg/L (× 1,000,000).'
-        ssc_var[:] = df['SSC'].values
+        ssc_var[:] = ssc_data
 
         # SSC flag
-        ssc_flag_var = ds.createVariable('SSC_flag', 'b', ('time',), fill_value=FLAG_MISSING)
+        ssc_flag_var = ds.createVariable('SSC_flag', 'b', ('time',), fill_value=FILL_VALUE_INT)
         ssc_flag_var.long_name = 'quality flag for suspended sediment concentration'
         ssc_flag_var.standard_name = 'status_flag'
         ssc_flag_var.flag_values = np.array([0, 1, 2, 3, 9], dtype=np.byte)
@@ -601,7 +790,7 @@ def write_netcdf(df, metadata, q_flag, ssc_flag, ssl_flag, output_file):
         ssc_flag_var[:] = ssc_flag
 
         # SSL (Suspended Sediment Load)
-        ssl_var = ds.createVariable('SSL', 'f4', ('time',), fill_value=FILL_VALUE)
+        ssl_var = ds.createVariable('SSL', 'f4', ('time',), fill_value=FILL_VALUE_FLOAT)
         ssl_var.long_name = 'suspended sediment load'
         ssl_var.units = 'ton day-1'
         ssl_var.coordinates = 'time lat lon'
@@ -612,10 +801,10 @@ def write_netcdf(df, metadata, q_flag, ssc_flag, ssl_flag, output_file):
             ssl_var.comment = 'Source: Original data provided by EUSEDcollab. Event data converted to daily rates: SSL (kg/event) divided by event duration (days) and 1000 kg/ton.'
         else:
             ssl_var.comment = 'Source: Original data provided by EUSEDcollab. Units converted from kg/day to ton/day (÷ 1000).'
-        ssl_var[:] = df['SSL'].values
+        ssl_var[:] = ssl_data
 
         # SSL flag
-        ssl_flag_var = ds.createVariable('SSL_flag', 'b', ('time',), fill_value=FLAG_MISSING)
+        ssl_flag_var = ds.createVariable('SSL_flag', 'b', ('time',), fill_value=FILL_VALUE_INT)
         ssl_flag_var.long_name = 'quality flag for suspended sediment load'
         ssl_flag_var.standard_name = 'status_flag'
         ssl_flag_var.flag_values = np.array([0, 1, 2, 3, 9], dtype=np.byte)

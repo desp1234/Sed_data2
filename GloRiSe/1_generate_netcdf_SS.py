@@ -16,7 +16,7 @@ import bibtexparser
 import re
 
 # File paths
-BASE_DIR = Path('/mnt/d/sediment_data/Source/GloRiSe')
+BASE_DIR = Path('/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/GloRiSe')
 REF_FILE = BASE_DIR / 'SedimentDatabase_ref.xlsx'
 LOC_FILE = BASE_DIR / 'SedimentDatabase_Locations.xlsx'
 ID_FILE = BASE_DIR / 'SedimentDatabase_ID.xlsx'
@@ -24,7 +24,7 @@ ME_FILE = BASE_DIR / 'SedimentDatabase_ME_Nut.xlsx'
 BIB_FILE = BASE_DIR / 'References_RiSe.bib'
 
 # Output directory
-OUTPUT_DIR = BASE_DIR / 'netcdf_output'
+OUTPUT_DIR = BASE_DIR / 'netcdf_output_SS'
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 def clean_latex_text(text):

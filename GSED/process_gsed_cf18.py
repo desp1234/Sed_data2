@@ -19,8 +19,25 @@ from datetime import datetime
 import subprocess
 from pathlib import Path
 import warnings
-
 warnings.filterwarnings('ignore')
+import sys
+import os
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
+if PARENT_DIR not in sys.path:
+    sys.path.insert(0, PARENT_DIR)
+from tool import (
+    FILL_VALUE_FLOAT,
+    FILL_VALUE_INT,
+    apply_quality_flag,
+    compute_log_iqr_bounds,
+    build_ssc_q_envelope,
+    check_ssc_q_consistency,
+    plot_ssc_q_diagnostic,
+    convert_ssl_units_if_needed,
+    check_nc_completeness,
+    add_global_attributes
+)
 
 # Quality flag definitions
 FLAG_GOOD = 0       # Good data
@@ -29,9 +46,6 @@ FLAG_SUSPECT = 2    # Suspect data (e.g., extreme values)
 FLAG_BAD = 3        # Bad data (e.g., negative values)
 FLAG_MISSING = 9    # Missing in source
 
-# Physical thresholds for QC
-SSC_MIN_VALID = 0.0     # mg/L - minimum valid SSC
-SSC_MAX_SUSPECT = 3000.0  # mg/L - values above this are suspect
 
 def get_geometry_info(shapefile_path, r_id):
     """
@@ -128,44 +142,76 @@ def get_year_month_from_index(start_year, start_month, index):
     month = (start_month - 1 + index) % 12 + 1
     return year, month
 
-def apply_qc_flags(ssc_data):
+def apply_gsed_qc_with_tool(ssc):
     """
-    Apply quality control checks and generate flags
+    Apply unified QC from tool.py for GSED SSC-only dataset.
 
-    QC Criteria:
-    - SSC < 0: Bad data (FLAG_BAD)
-    - SSC > 3000 mg/L: Suspect data (FLAG_SUSPECT)
-    - SSC is NaN: Missing data (FLAG_MISSING)
-    - Otherwise: Good data (FLAG_GOOD)
+    QC steps:
+    1) physical plausibility (apply_quality_flag)
+    2) log-IQR outlier detection (compute_log_iqr_bounds)
 
-    Args:
-        ssc_data: Array of SSC values
-
-    Returns:
-        tuple: (ssc_qc, flags) - QC'd data and flag array
+    Returns
+    -------
+    ssc_qc : array
+        SSC values (bad values set to NaN)
+    ssc_flag : array (int8)
+        QC flags
     """
-    flags = np.full_like(ssc_data, FLAG_MISSING, dtype=np.int8)
-    ssc_qc = ssc_data.copy()
 
-    # Check for missing data
-    missing_mask = np.isnan(ssc_data)
-    flags[missing_mask] = FLAG_MISSING
+    n = len(ssc)
 
-    # Check for bad data (negative values)
-    bad_mask = ~missing_mask & (ssc_data < SSC_MIN_VALID)
-    flags[bad_mask] = FLAG_BAD
-    # Set bad values to NaN
-    ssc_qc[bad_mask] = np.nan
+    ssc_flag = np.full(n, FILL_VALUE_INT, dtype=np.int8)
+    ssc_qc = ssc.astype(float).copy()
 
-    # Check for suspect data (extreme values)
-    suspect_mask = ~missing_mask & (ssc_data > SSC_MAX_SUSPECT)
-    flags[suspect_mask] = FLAG_SUSPECT
+    # -----------------------------
+    # Counters
+    # -----------------------------
+    n_missing = 0
+    n_bad = 0
+    n_suspect = 0
+    n_good = 0
 
-    # Mark good data
-    good_mask = ~missing_mask & ~bad_mask & ~suspect_mask
-    flags[good_mask] = FLAG_GOOD
+    # --------------------------------------------------
+    # 1) Physical QC
+    # --------------------------------------------------
+    for i in range(n):
+        ssc_flag[i] = apply_quality_flag(ssc_qc[i], variable_name="SSC")
 
-    return ssc_qc, flags
+        if ssc_flag[i] == FLAG_MISSING:
+            n_missing += 1
+        elif ssc_flag[i] == FLAG_BAD:
+            n_bad += 1
+            ssc_qc[i] = np.nan
+        elif ssc_flag[i] == FLAG_GOOD:
+            pass
+    # -----------------------------
+    # 2) Log-IQR QC
+    # -----------------------------
+    lower, upper = compute_log_iqr_bounds(ssc_qc)
+
+    if lower is not None:
+        outlier = (
+            (ssc_qc < lower) | (ssc_qc > upper)
+        ) & (ssc_flag == FLAG_GOOD)
+
+        ssc_flag[outlier] = FLAG_SUSPECT
+        n_suspect = np.sum(outlier)
+
+    # -----------------------------
+    # Final GOOD count
+    # -----------------------------
+    n_good = np.sum(ssc_flag == FLAG_GOOD)
+
+    qc_stats = {
+        "n_total": n,
+        "n_missing": int(n_missing),
+        "n_bad": int(n_bad),
+        "n_suspect": int(n_suspect),
+        "n_good": int(n_good),
+    }
+
+    return ssc_qc, ssc_flag, qc_stats
+
 
 def find_data_period(ssc_data, flags):
     """
@@ -208,10 +254,26 @@ def create_netcdf(r_id, ssc_data, time_array, lat, lon, length, output_dir):
         dict: Statistics for the station (for CSV summary)
     """
     # Apply QC and get flags
-    ssc_qc, flags = apply_qc_flags(ssc_data)
+    ssc_qc, flags, qc_stats = apply_gsed_qc_with_tool(ssc_data)
+
+    print(
+        f"Reach {r_id} QC summary:\n"
+        f"  total samples    : {qc_stats['n_total']}\n"
+        f"  missing (flag=9) : {qc_stats['n_missing']}\n"
+        f"  bad (flag=3)     : {qc_stats['n_bad']}\n"
+        f"  suspect (flag=2) : {qc_stats['n_suspect']}\n"
+        f"  good (flag=0)    : {qc_stats['n_good']}"
+    )
 
     # Find data period
     start_idx, end_idx = find_data_period(ssc_qc, flags)
+
+    trimmed = qc_stats['n_total'] - (end_idx - start_idx)
+
+    print(
+        f"  trimmed (no data at edges): {trimmed}\n"
+        f"  retained for output       : {end_idx - start_idx}"
+    )
 
     if start_idx is None:
         print(f"Reach {r_id}: No valid SSC data, skipping...")
@@ -386,6 +448,23 @@ def create_netcdf(r_id, ssc_data, time_array, lat, lon, length, output_dir):
 
     print(f"Created: {output_file}")
 
+    # --------------------------------------------------
+    # CF-1.8 / ACDD-1.3 compliance check
+    # --------------------------------------------------
+    # errors, warnings = check_nc_completeness(output_file)
+
+    # if errors:
+    #     print("❌ CF/ACDD compliance FAILED:")
+    #     for e in errors:
+    #         print("   -", e)
+    #     raise RuntimeError("NetCDF compliance check failed")
+
+    # if warnings:
+    #     print("⚠️ CF/ACDD compliance warnings:")
+    #     for w in warnings:
+    #         print("   -", w)
+
+
     # Return statistics for CSV
     stats = {
         'Source_ID': int(r_id),
@@ -453,10 +532,10 @@ def create_summary_csv(stats_list, output_dir):
 def main():
     """Main processing function"""
     # File paths
-    source_dir = Path('/Users/zhongwangwei/Downloads/Sediment/Source/GSED/GSED')
+    source_dir = Path('/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/GSED/GSED')
     csv_file = source_dir / 'GSED_Reach_Monthly_SSC.csv'
     shapefile = source_dir / 'GSED_Reach.shp'
-    output_dir = Path('/Users/zhongwangwei/Downloads/Sediment/Output_r/monthly/GSED')
+    output_dir = Path('/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Output_r/monthly/GSED/qc')
 
     # Create output directory
     output_dir.mkdir(parents=True, exist_ok=True)

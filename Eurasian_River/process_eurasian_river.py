@@ -17,13 +17,30 @@ from datetime import datetime, timedelta
 import os
 import re
 import glob
+import sys
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
+if PARENT_DIR not in sys.path:
+    sys.path.insert(0, PARENT_DIR)
+from tool import (
+    FILL_VALUE_FLOAT,
+    FILL_VALUE_INT,
+    apply_quality_flag,
+    compute_log_iqr_bounds,
+    build_ssc_q_envelope,
+    check_ssc_q_consistency,
+    plot_ssc_q_diagnostic,
+    convert_ssl_units_if_needed,
+    check_nc_completeness
+)
+
 
 # --- Configuration ---
 # --- Configuration ---
 BASE_DIR = "/share/home/dq134/wzx/sed_data/sediment_wzx_1111/"
 
 SOURCE_DIR = "/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/Eurasian_River"
-OUTPUT_DIR = "/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Output_r/monthly/Eurasian_River/test"
+OUTPUT_DIR = "/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Output_r/monthly/Eurasian_River/qc"
 SCRIPT_DIR = "/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Script/Dataset/Eurasian_River"
 
 # --- Helper Functions ---
@@ -188,6 +205,9 @@ def read_sediment_data():
 def main():
     """Main processing function."""
     create_output_dir()
+    DIAG_DIR = os.path.join(OUTPUT_DIR, "diagnostic")
+    os.makedirs(DIAG_DIR, exist_ok=True)
+
     discharge_data = read_discharge_data()
     sediment_data = read_sediment_data()
     summary_data = []
@@ -255,19 +275,52 @@ def main():
             print(f"  - No overlapping data for {river_name}. Skipping.")
             continue
 
-        # --- QC ---
-        df['Q_flag'] = 0  # Good data
-        df.loc[df['Q'] < 0, 'Q_flag'] = 3  # Bad data (negative value)
-        df.loc[df['Q'] == 0, 'Q_flag'] = 2  # Suspect data (zero flow)
-        df.loc[df['Q'] > 1000000, 'Q_flag'] = 2  # Suspect data (extreme high value)
+        # --- Quality Control and Flagging ---  
 
-        df['SSC_flag'] = 0  # Good data
-        df.loc[df['SSC'] < 0.1, 'SSC_flag'] = 3  # Bad data (negative value)
-        df.loc[df['SSC'] > 3000, 'SSC_flag'] = 2  # Suspect data (extreme high value)
-        df.loc[(df['Q'] == 0) & (df['SSL'] > 0), 'SSC_flag'] = 3 # Bad data (unphysical)
+        # =====================================
+        # SSL log-IQR bounds (station-level)
+        # =====================================
+        ssl_lower, ssl_upper = compute_log_iqr_bounds(
+            df['SSL'].values,
+            k=1.5)
+        # =====================================
+        # Apply initial quality flags     
+        # =====================================  
+        df['Q_flag'] = df['Q'].apply(lambda x: apply_quality_flag(x, 'Q'))
+        df['SSC_flag'] = df['SSC'].apply(lambda x: apply_quality_flag(x, 'SSC'))
+        df['SSL_flag'] = df['SSL'].apply(lambda x: apply_quality_flag(x, 'SSL'))
+        # =====================================
+        # Flag SSL outliers based on log-IQR bounds
+        # =====================================
+        if ssl_lower is not None and ssl_upper is not None:
+            is_outlier = (
+                (df['SSL'] < ssl_lower) |
+                (df['SSL'] > ssl_upper)
+            ) & (df['SSL_flag'] == 0)
 
-        df['SSL_flag'] = 0  # Good data
-        df.loc[df['SSL'] < 0, 'SSL_flag'] = 3  # Bad data (negative value)
+            df.loc[is_outlier, 'SSL_flag'] = 2  # suspect
+        # =====================================
+        # SSC-Q consistency check
+        # =====================================
+        ssc_q_bounds = build_ssc_q_envelope(
+        Q_m3s=df['Q'].values,
+        SSC_mgL=df['SSC'].values,
+        k=1.5,
+        min_samples=5
+        )
+
+        for i, row in df.iterrows():
+            is_bad, resid = check_ssc_q_consistency(
+                Q=row['Q'],
+                SSC=row['SSC'],
+                Q_flag=row['Q_flag'],
+                SSC_flag=row['SSC_flag'],
+                ssc_q_bounds=ssc_q_bounds
+            )
+
+            if is_bad:
+                df.at[i, 'SSC_flag'] = 2  # suspect
+
 
         # --- Time Trimming ---
         df.dropna(how='all', subset=['Q', 'SSL', 'SSC'], inplace=True)
@@ -306,8 +359,9 @@ def main():
 
             # Global Attributes
             nc.Conventions = "CF-1.8, ACDD-1.3"
-            nc.title = "Harmonized Global River Discharge and Sediment"
-            nc.dataset_name = "Eurasian River Dataset"
+            nc.title = "River sediment flux data for station RUS-Anabar"
+            nc.insitiution = "Eurasian Arctic River Database"
+            nc.dataset_name = "Eurasian River Historical Sediment Flux Data"
             nc.station_name = dis_data['meta'].get('station_name', river_name)
             nc.river_name = river_name
             nc.source_id = station_id
@@ -315,32 +369,37 @@ def main():
             nc.temporal_resolution = "monthly"
             nc.temporal_span = f"{df.index.min().strftime('%Y-%m-%d')} to {df.index.max().strftime('%Y-%m-%d')}"
             nc.geographic_coverage = f"{river_name} River Basin, Russia"
-            nc.variables_provided = "altitude, upstream_area, Q, SSC, SSL, station_name, river_name, Source_ID"
+            # nc.variables_provided = "altitude, upstream_area, Q, SSC, SSL, station_name, river_name, Source_ID"
+            nc.reference1 = "Holmes, R. M., McClelland, J. W., Peterson, B. J., Shiklomanov, I. A., Shiklomanov, A. I., Zhulidov, A. V., ... & Bobrovitskaya, N. N. (2002). A circumpolar perspective on fluvial sediment flux to the Arctic Ocean. Global biogeochemical cycles, 16(4), 45-1."
+            nc.reference2 = "Holmes, R., Peterson, B. (2009). Eurasian River Historical Nutrient and Sediment Flux Data. Version 1.0. NSF NCAR Earth Observing Laboratory. https://doi.org/10.5065/D6F769PB. Accessed 17 Oct 2025."
+            nc.comment = "Original data: Monthly sediment flux data. TSS concentration and discharge data not available for this dataset. Processed: Sediment load calculated from sediment flux data. SSC derived from: SSC = sediment_load / (discharge × 86.4)"
+            nc.discharge_data_source = "https://www.r-arcticnet.sr.unh.edu/v4.0/ViewPoint.pl?Point=5951"
+            nc.sediment_data_source = "https://doi.org/10.5065/D6F769PB"
             nc.creator_name = "Zhongwang Wei"
             nc.creator_email = "weizhw6@mail.sysu.edu.cn"
             nc.creator_institution = "Sun Yat-sen University, China"
             nc.history = f"Created on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} by process_eurasian_river.py"
 
             # Data Variables
-            q_var = nc.createVariable('Q', 'f4', ('time', 'lat', 'lon'), fill_value=-9999.0)
+            q_var = nc.createVariable('Q', 'f4', ('time', 'lat', 'lon'), fill_value=FILL_VALUE_FLOAT)
             q_var.units = 'm3 s-1'
             q_var.long_name = 'River Discharge'
             q_var.standard_name = 'river_discharge'
             q_var.ancillary_variables = 'Q_flag'
             q_var[:,0,0] = df['Q'].fillna(-9999.0).values
 
-            q_flag_var = nc.createVariable('Q_flag', 'b', ('time', 'lat', 'lon'))
+            q_flag_var = nc.createVariable('Q_flag', 'b', ('time', 'lat', 'lon'),fill_value=FILL_VALUE_INT)
             q_flag_var.long_name = 'Quality flag for River Discharge'
             q_flag_var.flag_values = [0, 1, 2, 3, 9]
             q_flag_var.flag_meanings = "good_data estimated_data suspect_data bad_data missing_data"
             q_flag_var[:,0,0] = df['Q_flag'].values
 
-            ssc_var = nc.createVariable('SSC', 'f4', ('time', 'lat', 'lon'), fill_value=-9999.0)
+            ssc_var = nc.createVariable('SSC', 'f4', ('time', 'lat', 'lon'), fill_value=FILL_VALUE_FLOAT)
             ssc_var.units = 'mg L-1'
             ssc_var.long_name = 'Suspended Sediment Concentration'
             ssc_var.standard_name = 'mass_concentration_of_suspended_matter_in_water'
             ssc_var.ancillary_variables = 'SSC_flag'
-            ssc_var[:,0,0] = df['SSC'].fillna(-9999.0).values
+            ssc_var[:,0,0] = df['SSC'].fillna(FILL_VALUE_FLOAT).values
 
             ssc_flag_var = nc.createVariable('SSC_flag', 'b', ('time', 'lat', 'lon'))
             ssc_flag_var.long_name = 'Quality flag for Suspended Sediment Concentration'
@@ -353,7 +412,7 @@ def main():
             ssl_var.long_name = 'Suspended Sediment Load'
             ssl_var.standard_name = 'suspended_sediment_load'
             ssl_var.ancillary_variables = 'SSL_flag'
-            ssl_var[:,0,0] = df['SSL'].fillna(-9999.0).values
+            ssl_var[:,0,0] = df['SSL'].fillna(FILL_VALUE_FLOAT).values
 
             ssl_flag_var = nc.createVariable('SSL_flag', 'b', ('time', 'lat', 'lon'))
             ssl_flag_var.long_name = 'Quality flag for Suspended Sediment Load'
@@ -362,6 +421,46 @@ def main():
             ssl_flag_var[:,0,0] = df['SSL_flag'].values
 
         print(f"  - Created {nc_filename}")
+
+        # ==========================================================
+        # Post-write CF-1.8 / ACDD-1.3 compliance check
+        # ==========================================================
+        # errors, warnings = check_nc_completeness(nc_filename)
+
+        # if errors:
+        #     print("  ❌ CF/ACDD compliance FAILED:")
+        #     for e in errors:
+        #         print(f"     - {e}")
+        #     raise RuntimeError(
+        #         f"NetCDF compliance check failed for {nc_filename}"
+        #     )
+
+        # if warnings:
+        #     print("  ⚠️ CF/ACDD compliance warnings:")
+        #     for w in warnings:
+        #         print(f"     - {w}")
+
+
+        # =====================================
+        # SSC–Q diagnostic plot
+        # =====================================
+        diag_png = os.path.join(
+            DIAG_DIR,
+            f"SSC_Q_{station_id}.png"
+        )
+
+        plot_ssc_q_diagnostic(
+            time=df.index.to_pydatetime(),
+            Q=df['Q'].values,
+            SSC=df['SSC'].values,
+            Q_flag=df['Q_flag'].values,
+            SSC_flag=df['SSC_flag'].values,
+            ssc_q_bounds=ssc_q_bounds,
+            station_id=station_id,
+            station_name=dis_data['meta'].get('station_name', river_name),
+            out_png=diag_png
+        )
+
 
         # --- Generate Summary ---
         summary_data.append({

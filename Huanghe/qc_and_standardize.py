@@ -20,38 +20,25 @@ from datetime import datetime
 import os
 import glob
 import sys
-
-def perform_qc_checks(ssc_value):
-    """
-    Perform quality control checks on SSC data and return quality flag.
-
-    Physical law checks for SSC (Suspended Sediment Concentration):
-    - SSC < 0: Bad data (negative value) -> flag = 3
-    - SSC > 3000 mg/L: Suspect data (extreme high value) -> flag = 2
-    - Otherwise: Good data -> flag = 0
-    - NaN values: Missing data -> flag = 9
-
-    Parameters:
-    -----------
-    ssc_value : float
-        SSC value in mg/L
-
-    Returns:
-    --------
-    flag : int
-        Quality flag (0=good, 1=estimated, 2=suspect, 3=bad, 9=missing)
-    """
-    if np.isnan(ssc_value) or ssc_value == -9999.0:
-        return 9  # Missing data
-    elif ssc_value < 0:
-        return 3  # Bad data (negative)
-    elif ssc_value > 60000:
-        return 2  # Suspect data (extreme high)
-    else:
-        return 0  # Good data
-
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
+if PARENT_DIR not in sys.path:
+    sys.path.insert(0, PARENT_DIR)
+from tool import (
+    FILL_VALUE_FLOAT,
+    FILL_VALUE_INT,
+    apply_quality_flag,
+    compute_log_iqr_bounds,
+    build_ssc_q_envelope,
+    check_ssc_q_consistency,
+    plot_ssc_q_diagnostic,
+    convert_ssl_units_if_needed,
+    check_nc_completeness,
+    add_global_attributes
+)
 
 def standardize_netcdf_file(input_file, output_dir):
+    
     """
     Standardize a single NetCDF file to CF-1.8 compliance with QC flags.
 
@@ -94,13 +81,108 @@ def standardize_netcdf_file(input_file, output_dir):
         time_calendar = ds_in.variables['time'].calendar
 
     # Perform QC checks
-    ssc_flags = np.array([perform_qc_checks(val) for val in ssc_vals], dtype=np.byte)
+    # ======================================================
+    # L0: basic physical QC (missing / negative)
+    # ======================================================
+    SSC_flag = np.array(
+        [apply_quality_flag(v, "SSC") for v in ssc_vals],
+        dtype=np.int8
+    )
+    # ======================================================
+    # L1: log-IQR screening for SSC
+    # ======================================================
+    valid_ssc = ssc_vals[(SSC_flag == 0) & np.isfinite(ssc_vals) & (ssc_vals > 0)]
+
+    if len(valid_ssc) < 5:
+        print(
+            f"  ℹ️  Station {station_id}: "
+            f"valid SSC samples = {len(valid_ssc)} < 5, "
+            "log-IQR QC skipped."
+        )
+    else:
+        lower, upper = compute_log_iqr_bounds(valid_ssc)
+
+        if lower is not None:
+            for i, v in enumerate(ssc_vals):
+                if (
+                    SSC_flag[i] == 0
+                    and np.isfinite(v)
+                    and v > 0
+                    and (v < lower or v > upper)
+                ):
+                    SSC_flag[i] = np.int8(2)  # suspect
+
+    # ======================================================
+    # L2: SSC–Q consistency check (only if Q exists)
+    # ======================================================
+    # if "Q" in ds_in.variables:
+    #     Q_vals = ds_in.variables["Q"][:]
+    #     Q_flag = np.array(
+    #         [apply_quality_flag(v, "Q") for v in Q_vals],
+    #         dtype=np.int8
+    #     )
+
+    #     ssc_q_bounds = build_ssc_q_envelope(Q_vals, ssc_vals)
+
+    #     if ssc_q_bounds is not None:
+    #         for i in range(len(ssc_vals)):
+    #             inconsistent, resid = check_ssc_q_consistency(
+    #                 Q_vals[i],
+    #                 ssc_vals[i],
+    #                 Q_flag[i],
+    #                 SSC_flag[i],
+    #                 ssc_q_bounds
+    #             )
+    #             if inconsistent:
+    #                 SSC_flag[i] = np.int8(2)  # suspect
+
+    # ======================================================
+    # SSC–Q diagnostic plot
+    # ======================================================
+    # if ssc_q_bounds is not None and "Q" in ds_in.variables:
+    #     out_png = os.path.join(
+    #         output_dir,
+    #         f"{station_id}_ssc_q_diagnostic.png"
+    #     )
+
+    #     plot_ssc_q_diagnostic(
+    #         time=dates,
+    #         Q=Q_vals,
+    #         SSC=ssc_vals,
+    #         Q_flag=Q_flag,
+    #         SSC_flag=SSC_flag,
+    #         ssc_q_bounds=ssc_q_bounds,
+    #         station_id=station_id,
+    #         station_name=station_name,
+    #         out_png=out_png,
+    #     )
+
+
 
     # Calculate statistics for CSV
-    ssc_data = np.ma.masked_where((ssc_vals == -9999.0) | np.isnan(ssc_vals), ssc_vals)
-    n_total = len(ssc_vals)
-    n_good = np.sum(ssc_flags == 0)
-    ssc_percent_complete = (n_good / n_total * 100) if n_total > 0 else 0
+    n_total = len(SSC_flag)
+    n_good = np.sum(SSC_flag == 0)
+    ssc_percent_complete = 100.0 * n_good / n_total if n_total > 0 else 0.0
+
+    # ======================================================
+    # QC final statistics (per station)
+    # ======================================================
+    qc_counts = {
+        "total": int(n_total),
+        "good": int(np.sum(SSC_flag == 0)),
+        "suspect": int(np.sum(SSC_flag == 2)),
+        "bad": int(np.sum(SSC_flag == 3)),
+        "missing": int(np.sum(SSC_flag == 9)),
+    }
+
+    print(
+        f"  QC summary:\n"
+        f"    total samples : {qc_counts['total']}\n"
+        f"    good (flag=0) : {qc_counts['good']}\n"
+        f"    suspect (2)   : {qc_counts['suspect']}\n"
+        f"    bad (3)       : {qc_counts['bad']}\n"
+        f"    missing (9)   : {qc_counts['missing']}"
+    )
 
     # Determine temporal span
     dates = nc.num2date(time_vals, units=time_units, calendar=time_calendar)
@@ -117,7 +199,16 @@ def standardize_netcdf_file(input_file, output_dir):
     print(f"  Station: {station_name} ({station_name_chinese})")
     print(f"  River: {river_name} ({river_name_chinese})")
     print(f"  Location: {lat:.4f}°N, {lon:.4f}°E")
-    print(f"  SSC: {ssc_vals[0]:.2f} mg/L (flag={ssc_flags[0]})")
+    valid = SSC_flag == 0
+    if np.any(valid):
+        ssc_repr = np.mean(ssc_vals[valid])
+        flag_repr = 0
+    else:
+        ssc_repr = ssc_vals[0]
+        flag_repr = SSC_flag[0]
+
+    print(f"  SSC (representative): {ssc_repr:.2f} mg/L (flag={flag_repr})")
+
     print(f"  Output: {os.path.basename(output_file)}")
 
     # Create standardized NetCDF file
@@ -191,7 +282,7 @@ def standardize_netcdf_file(input_file, output_dir):
         ssc_flag_var.flag_meanings = "good_data estimated_data suspect_data bad_data missing_data"
         ssc_flag_var.comment = "Flag definitions: 0=Good, 1=Estimated, 2=Suspect (e.g., zero/extreme), " \
                                "3=Bad (e.g., negative), 9=Missing in source."
-        ssc_flag_var[:] = ssc_flags
+        ssc_flag_var[:] = SSC_flag
 
         # Global attributes - following CF-1.8 and ACDD-1.3
         ds.Conventions = "CF-1.8, ACDD-1.3"
@@ -294,6 +385,29 @@ def standardize_netcdf_file(input_file, output_dir):
         'SSL_end_date': 'N/A',
         'SSL_percent_complete': 'N/A'
     }
+    station_info.update({
+    'SSC_n_total': qc_counts['total'],
+    'SSC_n_good': qc_counts['good'],
+    'SSC_n_suspect': qc_counts['suspect'],
+    'SSC_n_bad': qc_counts['bad'],
+    'SSC_n_missing': qc_counts['missing'],
+    })
+
+    # ======================================================
+    # CF / ACDD completeness check
+    # ======================================================
+    # errors, warnings = check_nc_completeness(output_file, strict=True)
+
+    # if errors:
+    #     raise RuntimeError(
+    #         f"CF/ACDD completeness check failed for {output_file}:\n"
+    #         + "\n".join(errors)
+    #     )
+
+    # if warnings:
+    #     print(f"Warnings for {output_file}:")
+    #     for w in warnings:
+    #         print("  -", w)
 
     return station_info
 
@@ -307,8 +421,8 @@ def main():
     print()
 
     # Paths
-    input_dir = '/mnt/d/sediment_data/Script/Dataset/Huanghe/done/'
-    output_dir = '/mnt/d/sediment_data/Script/Dataset/Huanghe/Output_r/'
+    input_dir = '/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/HuangHe/netcdf/'
+    output_dir = '/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Output_r/annually_climatology/Huanghe/'
 
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
@@ -356,7 +470,13 @@ def main():
         'Geographic Coverage', 'Reference/DOI',
         'Q_start_date', 'Q_end_date', 'Q_percent_complete',
         'SSC_start_date', 'SSC_end_date', 'SSC_percent_complete',
-        'SSL_start_date', 'SSL_end_date', 'SSL_percent_complete'
+        'SSL_start_date', 'SSL_end_date', 'SSL_percent_complete',
+        'SSC_n_total',
+        'SSC_n_good',
+        'SSC_n_suspect',
+        'SSC_n_bad',
+        'SSC_n_missing',
+
     ]
 
     df = df[column_order]
@@ -366,6 +486,9 @@ def main():
 
     print(f"Station summary saved to: {csv_file}")
     print(f"Total stations: {len(df)}")
+    print("\nGlobal QC summary (SSC):")
+    print(df[['SSC_n_good', 'SSC_n_suspect', 'SSC_n_bad', 'SSC_n_missing']].sum())
+
     print()
 
     # Print summary
@@ -379,16 +502,11 @@ def main():
     print("="*80)
     print("Quality Control Summary")
     print("="*80)
-    print("SSC Quality Checks Applied:")
-    print("  - SSC < 0: Flagged as BAD (flag=3)")
-    print("  - SSC > 3000 mg/L: Flagged as SUSPECT (flag=2)")
-    print("  - Valid SSC: Flagged as GOOD (flag=0)")
-    print("  - Missing/NaN: Flagged as MISSING (flag=9)")
-    print()
     print("NOTE: Discharge (Q) and sediment load (SSL) data are NOT available")
     print("      in the original Yellow River dataset (2015-2019).")
     print("="*80)
     print()
+    
 
 
 if __name__ == '__main__':

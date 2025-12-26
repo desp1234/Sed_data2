@@ -20,11 +20,30 @@ import pandas as pd
 from pathlib import Path
 from datetime import datetime
 import warnings
+import os
 warnings.filterwarnings('ignore')
+import sys
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
+if PARENT_DIR not in sys.path:
+    sys.path.insert(0, PARENT_DIR)
+from tool import (
+    FILL_VALUE_FLOAT,
+    FILL_VALUE_INT,
+    apply_quality_flag,
+    compute_log_iqr_bounds,
+    build_ssc_q_envelope,
+    check_ssc_q_consistency,
+    plot_ssc_q_diagnostic,
+    convert_ssl_units_if_needed,
+    check_nc_completeness,
+    add_global_attributes
+)
+
 
 # Configuration
-INPUT_DIR = Path('/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/GloRiSe/netcdf_output/')
-OUTPUT_DIR = Path('/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/GloRiSe/qc_standardized_output/')
+INPUT_DIR = Path('/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/GloRiSe/netcdf_output_BS/')
+OUTPUT_DIR = Path('/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Output_r/daily/GloRiSe/BS/qc/')
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Original data source information
@@ -49,66 +68,96 @@ QC_FLAGS = {
     9: 'missing_data'
 }
 
-# Physical thresholds for QC
-THRESHOLDS = {
-    'Q_min': 0,          # m³/s - negative values are bad
-    'Q_max': 300000,     # m³/s - extreme high (only largest rivers exceed this)
-    'SSC_min': 0,        # mg/L - negative values are bad
-    'SSC_max': 3000,     # mg/L - extreme high suspended sediment concentration
-    'SSL_min': 0         # ton/day - negative values are bad
-}
+# # Physical thresholds for QC
+# THRESHOLDS = {
+#     'Q_min': 0,          # m³/s - negative values are bad
+#     'Q_max': 300000,     # m³/s - extreme high (only largest rivers exceed this)
+#     'SSC_min': 0,        # mg/L - negative values are bad
+#     'SSC_max': 3000,     # mg/L - extreme high suspended sediment concentration
+#     'SSL_min': 0         # ton/day - negative values are bad
+# }
 
-
-def apply_qc_checks(discharge, ssc, ssl):
+def apply_tool_qc(discharge, ssc, ssl, return_envelope=True):
     """
-    Apply physical quality checks and assign flags.
-
-    Returns:
-    --------
-    q_flag, ssc_flag, ssl_flag : arrays of quality flags (byte)
+    Unified QC using tool.py:
+    - physical plausibility
+    - log-IQR on SSL
+    - SSC–Q consistency envelope
     """
-    n_time = len(discharge)
-    q_flag = np.zeros(n_time, dtype=np.int8)
-    ssc_flag = np.zeros(n_time, dtype=np.int8)
-    ssl_flag = np.zeros(n_time, dtype=np.int8)
 
-    # Check discharge
-    for i in range(n_time):
-        q = discharge[i]
-        if q == -9999.0 or np.isnan(q):
-            q_flag[i] = 9  # missing
-        elif q < THRESHOLDS['Q_min']:
-            q_flag[i] = 3  # bad (negative)
-        elif q == 0:
-            q_flag[i] = 2  # suspect (zero flow)
-        elif q > THRESHOLDS['Q_max']:
-            q_flag[i] = 2  # suspect (extreme high)
-        else:
-            q_flag[i] = 0  # good
+    n = len(discharge)
+    qc_report = {
+        "n_total": n,
+        "Q_physical_bad": 0,
+        "SSC_physical_bad": 0,
+        "SSL_physical_bad": 0,
+        "SSL_logIQR_suspect": 0,
+        "SSC_Q_inconsistent": 0,
+        "SSL_inherited_suspect": 0,
+    }
 
-    # Check SSC
-    for i in range(n_time):
-        c = ssc[i]
-        if c == -9999.0 or np.isnan(c):
-            ssc_flag[i] = 9  # missing
-        elif c < THRESHOLDS['SSC_min']:
-            ssc_flag[i] = 3  # bad (negative)
-        elif c > THRESHOLDS['SSC_max']:
-            ssc_flag[i] = 2  # suspect (extreme high)
-        else:
-            ssc_flag[i] = 0  # good
+   # -------------------------
+    # 1. basic physical QC
+    # -------------------------
+    q_flag   = np.array([apply_quality_flag(v, "Q")   for v in discharge], dtype=np.int8)
+    ssc_flag = np.array([apply_quality_flag(v, "SSC") for v in ssc],       dtype=np.int8)
+    ssl_flag = np.array([apply_quality_flag(v, "SSL") for v in ssl],       dtype=np.int8)
 
-    # Check SSL
-    for i in range(n_time):
-        s = ssl[i]
-        if s == -9999.0 or np.isnan(s):
-            ssl_flag[i] = 9  # missing
-        elif s < THRESHOLDS['SSL_min']:
-            ssl_flag[i] = 3  # bad (negative)
-        else:
-            ssl_flag[i] = 0  # good
+    qc_report["Q_physical_bad"]   = int(np.sum(q_flag   != 0))
+    qc_report["SSC_physical_bad"] = int(np.sum(ssc_flag != 0))
+    qc_report["SSL_physical_bad"] = int(np.sum(ssl_flag != 0))
 
-    return q_flag, ssc_flag, ssl_flag
+
+    # -------------------------
+    # 2. log-IQR screening (SSL)
+    # -------------------------
+    lower, upper = compute_log_iqr_bounds(ssl, k=1.5)
+    if lower is not None:
+        outlier = (
+            (ssl_flag == 0) &
+            ((ssl < lower) | (ssl > upper))
+        )
+        ssl_flag[outlier] = 2   # suspect
+        qc_report["SSL_logIQR_suspect"] = int(np.sum(outlier))
+
+    # -------------------------
+    # 3. SSC–Q envelope consistency
+    # -------------------------
+    ssc_q_bounds = build_ssc_q_envelope(
+        Q_m3s=discharge,
+        SSC_mgL=ssc,
+        k=1.5,
+        min_samples=5
+    )
+
+    if ssc_q_bounds is not None:
+        bad_cnt = 0
+        for i in range(n):
+            bad, _ = check_ssc_q_consistency(
+                Q=discharge[i],
+                SSC=ssc[i],
+                Q_flag=q_flag[i],
+                SSC_flag=ssc_flag[i],
+                ssc_q_bounds=ssc_q_bounds
+            )
+            if bad:
+                ssc_flag[i] = 2   # suspect
+                bad_cnt += 1
+        qc_report["SSC_Q_inconsistent"] = bad_cnt
+    else:
+        print("    ℹ️ SSC–Q diagnostic skipped (insufficient samples)")
+
+    # -------------------------
+    # 4. propagate to SSL
+    # -------------------------
+    inherited = (ssl_flag == 0) & ((q_flag != 0) | (ssc_flag != 0))
+    ssl_flag[inherited] = 2
+    qc_report["SSL_inherited_suspect"] = int(np.sum(inherited))
+
+    if return_envelope:
+        return q_flag, ssc_flag, ssl_flag, ssc_q_bounds, qc_report
+    else:
+        return q_flag, ssc_flag, ssl_flag, qc_report
 
 
 def get_valid_time_range(discharge, ssc, ssl, time_values):
@@ -202,12 +251,47 @@ def standardize_station_file(input_file):
         discharge = discharge_in[start_idx:end_idx]
         ssc = ssc_in[start_idx:end_idx]
         ssl = ssl_in[start_idx:end_idx]
-
+        
         # Apply QC checks
-        q_flag, ssc_flag, ssl_flag = apply_qc_checks(discharge, ssc, ssl)
+        q_flag, ssc_flag, ssl_flag, ssc_q_bounds,qc_report = apply_tool_qc(
+            discharge,
+            ssc,
+            ssl,
+            return_envelope=True
+        )
+        print("    QC summary:")
+        print(f"      total records           : {qc_report['n_total']}")
+        print(f"      Q physical flagged       : {qc_report['Q_physical_bad']}")
+        print(f"      SSC physical flagged     : {qc_report['SSC_physical_bad']}")
+        print(f"      SSL physical flagged     : {qc_report['SSL_physical_bad']}")
+        print(f"      SSL log-IQR suspect      : {qc_report['SSL_logIQR_suspect']}")
+        print(f"      SSC–Q inconsistent       : {qc_report['SSC_Q_inconsistent']}")
+        print(f"      SSL inherited suspect    : {qc_report['SSL_inherited_suspect']}")
+
 
         # Convert time to datetime for summary
         time_dates = convert_time_to_datetime(time, time_units)
+
+        # ----------------------------------
+        # SSC–Q diagnostic plot
+        # ----------------------------------
+        diag_dir = OUTPUT_DIR / "ssc_q_diagnostic"
+        diag_dir.mkdir(exist_ok=True)
+
+        if ssc_q_bounds is not None:
+            diag_png = diag_dir / f"GloRiSe_{station_id}_ssc_q_diagnostic.png"
+
+            plot_ssc_q_diagnostic(
+                time=time_dates,
+                Q=discharge,
+                SSC=ssc,
+                Q_flag=q_flag,
+                SSC_flag=ssc_flag,
+                ssc_q_bounds=ssc_q_bounds,
+                station_id=station_id,
+                station_name=station_id,
+                out_png=str(diag_png)
+            )
 
         # Calculate statistics for each variable
         def calc_stats(data, flags):
@@ -383,7 +467,21 @@ def standardize_station_file(input_file):
 
         # Close files
         ds_out.close()
-        ds_in.close()
+
+        # errors, warnings = check_nc_completeness(str(output_file))
+
+        # if errors:
+        #     print("  ❌ CF/ACDD compliance FAILED:")
+        #     for e in errors:
+        #         print("     -", e)
+        #     return None
+
+        # if warnings:
+        #     print("  ⚠️ CF/ACDD compliance warnings:")
+        #     for w in warnings:
+        #         print("     -", w)
+
+        # ds_in.close()
 
         print(f"  ✓ Processed: {len(time)} records, {temporal_start} to {temporal_end}")
         print(f"    Q: {q_pct:.1f}% complete, SSC: {ssc_pct:.1f}% complete, SSL: {ssl_pct:.1f}% complete")
@@ -415,7 +513,7 @@ def standardize_station_file(input_file):
             'SSL_percent_complete': f'{ssl_pct:.1f}' if ssl_pct else ''
         }
 
-        return station_info
+        return station_info, qc_report
 
     except Exception as e:
         print(f"  ✗ Error: {e}")
@@ -424,6 +522,18 @@ def standardize_station_file(input_file):
 
 
 def main():
+
+    global_qc = {
+    "stations": 0,
+    "records": 0,
+    "Q_physical_bad": 0,
+    "SSC_physical_bad": 0,
+    "SSL_physical_bad": 0,
+    "SSL_logIQR_suspect": 0,
+    "SSC_Q_inconsistent": 0,
+    "SSL_inherited_suspect": 0,
+    }
+
     """Main processing function."""
     print("="*80)
     print("GloRiSe Dataset: Comprehensive QC and CF-1.8 Standardization")
@@ -446,13 +556,21 @@ def main():
     skipped_count = 0
 
     for input_file in input_files:
-        station_info = standardize_station_file(input_file)
+        station_info, qc_report = standardize_station_file(input_file)
 
         if station_info is not None:
             station_list.append(station_info)
             processed_count += 1
         else:
             skipped_count += 1
+        
+        if qc_report is not None:
+            global_qc["stations"] += 1
+            global_qc["records"] += qc_report["n_total"]
+
+            for k in global_qc:
+                if k in qc_report:
+                    global_qc[k] += qc_report[k]
 
     # Generate CSV summary
     if station_list:
@@ -488,6 +606,12 @@ def main():
     print("  • Trimmed time ranges to data availability")
     print("  • Standardized metadata to CF-1.8 and ACDD-1.3")
     print("="*80)
+    
+    print("\nQC GLOBAL SUMMARY")
+    print("-" * 80)
+    for k, v in global_qc.items():
+        print(f"{k:30s}: {v}")
+
 
 
 if __name__ == '__main__':

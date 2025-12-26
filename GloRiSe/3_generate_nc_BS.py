@@ -24,7 +24,7 @@ ME_FILE = BASE_DIR / 'SedimentDatabase_ME_Nut.xlsx'
 BIB_FILE = BASE_DIR / 'References_RiSe.bib'
 
 # Output directory
-OUTPUT_DIR = BASE_DIR / 'netcdf_output'
+OUTPUT_DIR = BASE_DIR / 'netcdf_output_BS'
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 def clean_latex_text(text):
