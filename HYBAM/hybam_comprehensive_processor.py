@@ -42,6 +42,23 @@ from pathlib import Path
 import json
 import warnings
 warnings.filterwarnings('ignore')
+import sys
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
+if PARENT_DIR not in sys.path:
+    sys.path.insert(0, PARENT_DIR)
+from tool import (
+    FILL_VALUE_FLOAT,
+    FILL_VALUE_INT,
+    apply_quality_flag,
+    compute_log_iqr_bounds,
+    build_ssc_q_envelope,
+    check_ssc_q_consistency,
+    plot_ssc_q_diagnostic,
+    convert_ssl_units_if_needed,
+    check_nc_completeness,
+    add_global_attributes
+)
 
 STATION_INFO = {
     "4071002205": {"lon": -63.40258, "lat": -18.90892, "alt": 430},
@@ -67,11 +84,11 @@ STATION_INFO = {
 class HYBAMProcessor:
     """Process HYBAM discharge and sediment data with full QC and CF-1.8 compliance."""
 
-    # Physical thresholds for QC
-    Q_MIN = 0.0  # m3/s
-    Q_MAX = 500000.0  # Extreme threshold (m3/s)
-    SSC_MIN = 0.0  # mg/L
-    SSC_MAX = 3000.0  # mg/L extreme threshold
+    # # Physical thresholds for QC
+    # Q_MIN = 0.0  # m3/s
+    # Q_MAX = 500000.0  # Extreme threshold (m3/s)
+    # SSC_MIN = 0.0  # mg/L
+    # SSC_MAX = 3000.0  # mg/L extreme threshold
 
     # Quality flag definitions
     FLAG_GOOD = 0
@@ -177,7 +194,7 @@ class HYBAMProcessor:
 
             # Read data values
             data_values = ds.variables[data_varname][:]
-            fill_value = getattr(ds.variables[data_varname], '_FillValue', -9999.0)
+            fill_value = getattr(ds.variables[data_varname], '_FillValue', FILL_VALUE_FLOAT)
 
             # Read quality information
             origine = ds.variables.get('_Origine', [None] * len(time_seconds))[:]
@@ -239,7 +256,7 @@ class HYBAMProcessor:
                 result['discharge_quality'] = discharge_quality[q_start:q_end+1] if discharge_quality is not None else None
 
                 # Map SSC to discharge time axis
-                ssc_mapped = np.full(len(result['time']), -9999.0, dtype='f4')
+                ssc_mapped = np.full(len(result['time']), FILL_VALUE_FLOAT, dtype='f4')
                 for i, q_time in enumerate(result['time']):
                     # Find closest SSC time
                     idx = np.argmin(np.abs(ssc_time - q_time))
@@ -266,91 +283,119 @@ class HYBAMProcessor:
         return result
 
     def apply_qc_checks(self, data_dict):
-        """Apply physical consistency checks and create quality flags.
-
-        Returns:
-            dict: Augmented with quality flag variables
         """
-        time_days = data_dict['time'] / 86400.0 if data_dict['time'] is not None else None
-        n_times = len(time_days) if time_days is not None else 0
+        Apply QC using unified tool.py framework:
+        L0: physical validity
+        L1: log-IQR screening
+        L2: SSC–Q consistency
+        """
 
-        # Initialize flags to MISSING
-        data_dict['Q_flag'] = np.full(n_times, self.FLAG_MISSING, dtype='i1')
-        data_dict['SSC_flag'] = np.full(n_times, self.FLAG_MISSING, dtype='i1')
-        data_dict['SSL_flag'] = np.full(n_times, self.FLAG_MISSING, dtype='i1')
+        time_sec = data_dict.get("time")
+        n = len(time_sec) if time_sec is not None else 0
 
-        if data_dict['discharge'] is not None:
-            Q = data_dict['discharge']
-            flag = data_dict['Q_flag']
+        Q = data_dict.get("discharge")
+        SSC = data_dict.get("ssc")
 
-            # Valid mask: not fill value
-            valid = Q != getattr(data_dict, 'discharge_fill', -9999.0)
-            flag[~valid] = self.FLAG_MISSING
+        # --------------------------------------------------
+        # L0: basic physical QC
+        # --------------------------------------------------
+        Q_flag = (
+            np.array([apply_quality_flag(v, "Q") for v in Q], dtype=np.int8)
+            if Q is not None else None
+        )
 
-            # Check for negative values
-            bad_neg = (Q < 0) & valid
-            flag[bad_neg] = self.FLAG_BAD
+        SSC_flag = (
+            np.array([apply_quality_flag(v, "SSC") for v in SSC], dtype=np.int8)
+            if SSC is not None else None
+        )
 
-            # Check for zero (suspect)
-            suspect_zero = (Q == 0) & valid & ~bad_neg
-            flag[suspect_zero] = self.FLAG_SUSPECT
+        data_dict["Q_flag"] = Q_flag
+        data_dict["SSC_flag"] = SSC_flag
 
-            # Check for extreme high values
-            suspect_high = (Q > self.Q_MAX) & valid & ~bad_neg & ~suspect_zero
-            flag[suspect_high] = self.FLAG_SUSPECT
+        # --------------------------------------------------
+        # L1: log-IQR screening (independent variables)
+        # --------------------------------------------------
+        if Q is not None:
+            valid_Q = Q[(Q_flag == 0) & np.isfinite(Q) & (Q > 0)]
+            q_lo, q_hi = compute_log_iqr_bounds(valid_Q)
+            if q_lo is not None:
+                for i, v in enumerate(Q):
+                    if Q_flag[i] == 0 and (v < q_lo or v > q_hi):
+                        Q_flag[i] = 2  # suspect
 
-            # Good data
-            good = valid & ~bad_neg & ~suspect_zero & ~suspect_high
-            flag[good] = self.FLAG_GOOD
+        if SSC is not None:
+            valid_SSC = SSC[(SSC_flag == 0) & np.isfinite(SSC) & (SSC > 0)]
+            ssc_lo, ssc_hi = compute_log_iqr_bounds(valid_SSC)
+            if ssc_lo is not None:
+                for i, v in enumerate(SSC):
+                    if SSC_flag[i] == 0 and (v < ssc_lo or v > ssc_hi):
+                        SSC_flag[i] = 2  # suspect
 
-            data_dict['Q_flag'] = flag
+        # --------------------------------------------------
+        # L2: SSC–Q consistency (core hydrological QC)
+        # --------------------------------------------------
+        ssc_q_bounds = None
+        if Q is not None and SSC is not None:
+            ssc_q_bounds = build_ssc_q_envelope(Q, SSC)
 
-        if data_dict['ssc'] is not None:
-            SSC = data_dict['ssc']
-            flag = data_dict['SSC_flag']
+            if ssc_q_bounds is not None:
+                for i in range(n):
+                    inconsistent, resid = check_ssc_q_consistency(
+                        Q[i],
+                        SSC[i],
+                        Q_flag[i],
+                        SSC_flag[i],
+                        ssc_q_bounds
+                    )
+                    if inconsistent:
+                        SSC_flag[i] = 2  # suspect
 
-            # Valid mask
-            valid = SSC != getattr(data_dict, 'ssc_fill', -9999.0)
-            flag[~valid] = self.FLAG_MISSING
+        # --------------------------------------------------
+        # Derived SSL
+        # --------------------------------------------------
+        if Q is not None and SSC is not None:
+            SSL = np.full(n, FILL_VALUE_FLOAT, dtype="f4")
+            SSL_flag = np.full(n, FILL_VALUE_INT, dtype="i1")
 
-            # Check for negative values
-            bad_neg = (SSC < 0) & valid
-            flag[bad_neg] = self.FLAG_BAD
+            valid = (
+                (Q_flag <= 1)
+                & (SSC_flag <= 1)
+                & np.isfinite(Q)
+                & np.isfinite(SSC)
+                & (Q > 0)
+                & (SSC > 0)
+            )
 
-            # Check for extreme high values
-            suspect_high = (SSC > self.SSC_MAX) & valid & ~bad_neg
-            flag[suspect_high] = self.FLAG_SUSPECT
+            SSL[valid] = Q[valid] * SSC[valid] * 86.4
+            SSL_flag[valid] = np.maximum(Q_flag[valid], SSC_flag[valid])
 
-            # Good data
-            good = valid & ~bad_neg & ~suspect_high
-            flag[good] = self.FLAG_GOOD
+            data_dict["SSL"] = SSL
+            data_dict["SSL_flag"] = SSL_flag
 
-            data_dict['SSC_flag'] = flag
+        # --------------------------------------------------
+        # Diagnostic plot (station-level)
+        # --------------------------------------------------
+        if ssc_q_bounds is not None:
+            out_png = self.output_r_dir / f"{data_dict['station_id']}_ssc_q_diagnostic.png"
+            # Ensure output directory exists for diagnostic plot
+            try:
+                out_png.parent.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
 
-        # Calculate SSL and its flag
-        if data_dict['discharge'] is not None and data_dict['ssc'] is not None:
-            Q = data_dict['discharge']
-            SSC = data_dict['ssc']
-            Q_flag = data_dict['Q_flag']
-            SSC_flag = data_dict['SSC_flag']
-
-            # SSL = Q (m3/s) * SSC (mg/L) * 86.4 = SSL (ton/day)
-            # 86.4 = 86400 s/day * 1000 L/m3 * 10^-6 ton/mg
-            SSL = np.full(len(Q), -9999.0, dtype='f4')
-            ssl_flag = np.full(len(Q), self.FLAG_MISSING, dtype='i1')
-
-            # Calculate SSL where both Q and SSC are good or estimated
-            valid_for_calc = (Q != -9999.0) & (SSC != -9999.0) & \
-                           (Q_flag <= self.FLAG_ESTIMATED) & (SSC_flag <= self.FLAG_ESTIMATED)
-            SSL[valid_for_calc] = Q[valid_for_calc] * SSC[valid_for_calc] * 86.4
-            ssl_flag[valid_for_calc] = np.maximum(Q_flag[valid_for_calc], SSC_flag[valid_for_calc])
-
-            # Mark as bad if either is bad
-            bad = (Q_flag == self.FLAG_BAD) | (SSC_flag == self.FLAG_BAD)
-            ssl_flag[bad] = self.FLAG_BAD
-
-            data_dict['SSL'] = SSL
-            data_dict['SSL_flag'] = ssl_flag
+            plot_ssc_q_diagnostic(
+                time=np.array(
+                    [datetime.utcfromtimestamp(t) for t in time_sec]
+                ),
+                Q=Q,
+                SSC=SSC,
+                Q_flag=Q_flag,
+                SSC_flag=SSC_flag,
+                ssc_q_bounds=ssc_q_bounds,
+                station_id=data_dict["station_id"],
+                station_name=data_dict.get("station_name", ""),
+                out_png=str(out_png),
+            )
 
         return data_dict
 
@@ -380,8 +425,8 @@ class HYBAMProcessor:
         time_days = data_dict['time'] / 86400.0
         n_times = len(time_days)
 
-        # Prepare fill value
-        fill_value = -9999.0
+        # Prepare fill value (from tool.py)
+        fill_value = FILL_VALUE_FLOAT
 
         with nc.Dataset(output_file, 'w', format='NETCDF4', diskless=False) as ds:
             # =============
@@ -439,7 +484,7 @@ class HYBAMProcessor:
             # =============
             # Discharge (Q)
             if data_dict['discharge'] is not None:
-                Q_var = ds.createVariable('Q', 'f4', ('time',), zlib=True, complevel=4)
+                Q_var = ds.createVariable('Q', 'f4', ('time',), zlib=True, complevel=4, fill_value=fill_value)
                 Q_var.standard_name = 'water_volume_transport_in_river_channel'
                 Q_var.long_name = 'river discharge'
                 Q_var.units = 'm3 s-1'
@@ -450,18 +495,18 @@ class HYBAMProcessor:
                 Q_var[:] = data_dict['discharge']
 
                 # Q Quality Flag
-                Q_flag_var = ds.createVariable('Q_flag', 'i1', ('time',), zlib=True, complevel=4)
+                Q_flag_var = ds.createVariable('Q_flag', 'i1', ('time',), zlib=True, complevel=4, fill_value=FILL_VALUE_INT)
                 Q_flag_var.long_name = 'quality flag for river discharge'
                 Q_flag_var.standard_name = 'status_flag'
                 Q_flag_var.flag_values = np.array([0, 1, 2, 3, 9], dtype='i1')
                 Q_flag_var.flag_meanings = self.FLAG_MEANINGS
                 Q_flag_var.comment = 'Flag definitions: 0=Good, 1=Estimated, 2=Suspect (e.g., zero/extreme), 3=Bad (e.g., negative), 9=Missing in source.'
-                Q_flag_var.missing_value = self.FLAG_MISSING
+                Q_flag_var.missing_value = FILL_VALUE_INT
                 Q_flag_var[:] = data_dict['Q_flag']
 
             # Suspended Sediment Concentration (SSC)
             if data_dict['ssc'] is not None:
-                SSC_var = ds.createVariable('SSC', 'f4', ('time',), zlib=True, complevel=4)
+                SSC_var = ds.createVariable('SSC', 'f4', ('time',), zlib=True, complevel=4, fill_value=fill_value)
                 SSC_var.standard_name = 'mass_concentration_of_suspended_matter_in_water'
                 SSC_var.long_name = 'suspended sediment concentration'
                 SSC_var.units = 'mg L-1'
@@ -472,35 +517,35 @@ class HYBAMProcessor:
                 SSC_var[:] = data_dict['ssc']
 
                 # SSC Quality Flag
-                SSC_flag_var = ds.createVariable('SSC_flag', 'i1', ('time',), zlib=True, complevel=4)
+                SSC_flag_var = ds.createVariable('SSC_flag', 'i1', ('time',), zlib=True, complevel=4, fill_value=FILL_VALUE_INT)
                 SSC_flag_var.long_name = 'quality flag for suspended sediment concentration'
                 SSC_flag_var.standard_name = 'status_flag'
                 SSC_flag_var.flag_values = np.array([0, 1, 2, 3, 9], dtype='i1')
                 SSC_flag_var.flag_meanings = self.FLAG_MEANINGS
                 SSC_flag_var.comment = 'Flag definitions: 0=Good, 1=Estimated, 2=Suspect (e.g., zero/extreme), 3=Bad (e.g., negative), 9=Missing in source.'
-                SSC_flag_var.missing_value = self.FLAG_MISSING
+                SSC_flag_var.missing_value = FILL_VALUE_INT
                 SSC_flag_var[:] = data_dict['SSC_flag']
 
             # Suspended Sediment Load (SSL)
             if 'SSL' in data_dict:
-                SSL_var = ds.createVariable('SSL', 'f4', ('time',), zlib=True, complevel=4)
+                SSL_var = ds.createVariable('SSL', 'f4', ('time',), zlib=True, complevel=4, fill_value=fill_value)
                 SSL_var.standard_name = 'suspended_sediment_transport_in_river'
                 SSL_var.long_name = 'suspended sediment load'
                 SSL_var.units = 'ton day-1'
                 SSL_var.coordinates = 'time lat lon'
                 SSL_var.ancillary_variables = 'SSL_flag'
                 SSL_var.comment = 'Source: Calculated. Formula: SSL (ton/day) = Q (m³/s) × SSC (mg/L) × 86.4'
-                SSL_var.missing_value = fill_value
+                SSL_var.missing_value = fill_valuef
                 SSL_var[:] = data_dict['SSL']
 
                 # SSL Quality Flag
-                SSL_flag_var = ds.createVariable('SSL_flag', 'i1', ('time',), zlib=True, complevel=4)
+                SSL_flag_var = ds.createVariable('SSL_flag', 'i1', ('time',), zlib=True, complevel=4, fill_value=FILL_VALUE_INT)
                 SSL_flag_var.long_name = 'quality flag for suspended sediment load'
                 SSL_flag_var.standard_name = 'status_flag'
                 SSL_flag_var.flag_values = np.array([0, 1, 2, 3, 9], dtype='i1')
                 SSL_flag_var.flag_meanings = self.FLAG_MEANINGS
                 SSL_flag_var.comment = 'Flag definitions: 0=Good, 1=Estimated, 2=Suspect (e.g., zero/extreme), 3=Bad (e.g., negative), 9=Missing in source.'
-                SSL_flag_var.missing_value = self.FLAG_MISSING
+                SSL_flag_var.missing_value = FILL_VALUE_INT
                 SSL_flag_var[:] = data_dict['SSL_flag']
 
             # =============
@@ -572,6 +617,17 @@ class HYBAMProcessor:
             ds.processing_level = 'Quality controlled and standardized'
 
             ds.number_of_data = str(len([d for d in data_dict['discharge'] if d != fill_value]) if data_dict['discharge'] is not None else 0)
+            # Add legacy/alternate global attribute names expected by completeness checker
+            ds.Type = 'In-situ'
+            ds.Temporal_Resolution = ds.temporal_resolution
+            ds.Temporal_Span = ds.temporal_span if hasattr(ds, 'temporal_span') else ''
+            ds.Variables_Provided = ds.variables_provided
+            ds.Geographic_Coverage = ds.geographic_coverage
+            ds.Reference = ds.reference
+            # Location and administrative metadata (best-effort)
+            ds.location_id = station_id
+            ds.country = ''
+            ds.continent_region = ''
 
     def process_station(self, station_dir):
         """Process a single station through the complete pipeline."""
@@ -604,13 +660,18 @@ class HYBAMProcessor:
         print(f"    ✓ Time range: {data['time_coverage_start']} to {data['time_coverage_end']} ({len(data['time'])} days)")
 
         # Apply QC checks
+        # Ensure identifying metadata present for plotting and outputs
+        data['station_id'] = station_id
+        data['station_name'] = station_name
+        data['river_name'] = river_name
+
         data = self.apply_qc_checks(data)
 
         # Get metadata from existing HYBAM file
-        latitude = -9999.0
-        longitude = -9999.0
-        altitude = -9999.0
-        upstream_area = -9999.0
+        latitude = FILL_VALUE_FLOAT
+        longitude = FILL_VALUE_FLOAT
+        altitude = FILL_VALUE_FLOAT
+        upstream_area = FILL_VALUE_FLOAT
 
         info = STATION_INFO.get(station_id, None)
 
@@ -619,9 +680,9 @@ class HYBAMProcessor:
             longitude = info["lon"]
             altitude = info["alt"]
         else:
-            latitude = -9999.0
-            longitude = -9999.0
-            altitude = -9999.0
+            latitude = FILL_VALUE_FLOAT
+            longitude = FILL_VALUE_FLOAT
+            altitude = FILL_VALUE_FLOAT
 
         # Write CF-1.8 compliant NetCDF
         output_file = self.output_r_dir / f'HYBAM_{station_id}.nc'
@@ -629,6 +690,20 @@ class HYBAMProcessor:
 
         self.write_cf18_netcdf(station_id, station_name, river_name, latitude, longitude,
                               altitude, upstream_area, data, output_file)
+
+        errors, warnings = check_nc_completeness(output_file, strict=True)
+
+        if errors:
+            raise RuntimeError(
+                f"CF/ACDD completeness check failed for {output_file}:\n"
+                + "\n".join(errors)
+            )
+
+        if warnings:
+            print(f"  ⚠ CF/ACDD warnings for {output_file.name}:")
+            for w in warnings:
+                print("    -", w)
+
 
         print(f"    ✓ Written: {output_file.name}")
 
@@ -776,8 +851,8 @@ class HYBAMProcessor:
 def main():
     """Main entry point."""
     source_dir = '/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/HYBAM/source'
-    output_dir = '/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Output/daily/HYBAM'
-    output_r_dir = '/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Output_r/daily/HYBAM'
+    output_dir = '/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Output_r/daily/HYBAM/Output/'
+    output_r_dir = '/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Output_r/daily/HYBAM/qc/'
 
     processor = HYBAMProcessor(source_dir, output_dir, output_r_dir)
     processor.run()

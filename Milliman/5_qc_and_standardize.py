@@ -27,58 +27,23 @@ from datetime import datetime
 import os
 import glob
 import sys
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
+if PARENT_DIR not in sys.path:
+    sys.path.insert(0, PARENT_DIR)
+from tool import (
+    FILL_VALUE_FLOAT,
+    FILL_VALUE_INT,
+    apply_quality_flag,
+    compute_log_iqr_bounds,
+    build_ssc_q_envelope,
+    check_ssc_q_consistency,
+    plot_ssc_q_diagnostic,
+    convert_ssl_units_if_needed,
+    check_nc_completeness,
+    add_global_attributes
+)
 
-def perform_qc_checks(value, var_type='Q'):
-    """
-    Perform quality control checks and return quality flag.
-
-    Quality flags:
-    0 = Good data
-    1 = Estimated data
-    2 = Suspect data (extreme or zero values)
-    3 = Bad data (negative or invalid)
-    9 = Missing data
-
-    Parameters:
-    -----------
-    value : float
-        Value to check
-    var_type : str
-        Type of variable: 'Q', 'SSC', or 'SSL'
-
-    Returns:
-    --------
-    flag : int
-        Quality flag (0, 1, 2, 3, or 9)
-    """
-    if np.isnan(value) or value == -9999.0:
-        return 9  # Missing data
-
-    if var_type == 'Q':  # Discharge
-        if value < 0:
-            return 3  # Bad data (negative)
-        elif value == 0:
-            return 2  # Suspect (zero flow - unusual for climatology)
-        elif value > 500000:  # Extremely high (> Amazon peak)
-            return 2  # Suspect
-        else:
-            return 0  # Good data
-
-    elif var_type == 'SSC':  # Suspended Sediment Concentration
-        if value < 0:
-            return 3  # Bad data (negative)
-        elif value > 3000:  # mg/L
-            return 2  # Suspect (extremely high)
-        else:
-            return 0  # Good data
-
-    elif var_type == 'SSL':  # Suspended Sediment Load
-        if value < 0:
-            return 3  # Bad data (negative)
-        else:
-            return 0  # Good data (no upper limit for SSL)
-
-    return 0
 
 
 def standardize_netcdf_file(input_file, output_dir):
@@ -143,10 +108,13 @@ def standardize_netcdf_file(input_file, output_dir):
         print(f"  SKIPPED: No valid Q or SSC data")
         return None
 
-    # Perform QC checks
-    q_flag = perform_qc_checks(q_val, 'Q')
-    ssc_flag = perform_qc_checks(ssc_val, 'SSC')
-    ssl_flag = perform_qc_checks(tss_val, 'SSL')
+    # ======================================================
+    # Quality control using tool.py (climatology-safe)
+    # ======================================================
+    q_flag = apply_quality_flag(q_val, "Q")
+    ssc_flag = apply_quality_flag(ssc_val, "SSC")
+    ssl_flag = apply_quality_flag(tss_val, "SSL")
+
 
     # Calculate statistics for CSV
     q_percent = 100.0 if q_flag == 0 else 0.0
@@ -360,6 +328,23 @@ def standardize_netcdf_file(input_file, output_dir):
         ds.country = country
         ds.continent_region = continent
 
+        # ======================================================
+        # CF-1.8 / ACDD-1.3 completeness check
+        # ======================================================
+        # errors, warnings = check_nc_completeness(output_file, strict=True)
+
+        # if errors:
+        #     print(f"  ✗ Completeness check FAILED: {os.path.basename(output_file)}")
+        #     for e in errors:
+        #         print(f"    ERROR: {e}")
+        #     os.remove(output_file)
+        #     return None
+
+        # if warnings:
+        #     print(f"  ⚠ Completeness warnings for {os.path.basename(output_file)}:")
+        #     for w in warnings:
+        #         print(f"    WARNING: {w}")
+
     # Prepare station info for CSV
     station_info = {
         'station_name': river_name,
@@ -384,13 +369,25 @@ def standardize_netcdf_file(input_file, output_dir):
         'SSC_percent_complete': ssc_percent if not np.isnan(ssc_val) and ssc_val != -9999.0 else 'N/A',
         'SSL_start_date': representative_year if not np.isnan(tss_val) and tss_val != -9999.0 else 'N/A',
         'SSL_end_date': representative_year if not np.isnan(tss_val) and tss_val != -9999.0 else 'N/A',
-        'SSL_percent_complete': ssl_percent if not np.isnan(tss_val) and tss_val != -9999.0 else 'N/A'
+        'SSL_percent_complete': ssl_percent if not np.isnan(tss_val) and tss_val != -9999.0 else 'N/A',
+        "Q_flag": int(q_flag),
+        "SSC_flag": int(ssc_flag),
+        "SSL_flag": int(ssl_flag),
     }
 
     return station_info
 
 
 def main():
+
+    qc_stats = {
+    "total_stations": 0,
+
+    "Q": {"good": 0, "bad": 0, "missing": 0},
+    "SSC": {"good": 0, "bad": 0, "missing": 0},
+    "SSL": {"good": 0, "bad": 0, "missing": 0},
+    }
+
     """Main processing function."""
 
     print("="*80)
@@ -399,8 +396,8 @@ def main():
     print()
 
     # Paths
-    input_dir = '/Users/zhongwangwei/Downloads/Sediment/Output/annually_climatology/Milliman'
-    output_dir = '/Users/zhongwangwei/Downloads/Sediment/Output_r/annually_climatology/Milliman'
+    input_dir = '/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/Milliman/netcdf_output'
+    output_dir = '/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Output_r/annually_climatology/Milliman/qc/'
 
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
@@ -430,6 +427,32 @@ def main():
             if station_info:
                 station_info_list.append(station_info)
                 processed_count += 1
+                qc_stats["total_stations"] += 1
+
+                # Q
+                if station_info["Q_flag"] == 0:
+                    qc_stats["Q"]["good"] += 1
+                elif station_info["Q_flag"] == 3:
+                    qc_stats["Q"]["bad"] += 1
+                elif station_info["Q_flag"] == 9:
+                    qc_stats["Q"]["missing"] += 1
+
+                # SSC
+                if station_info["SSC_flag"] == 0:
+                    qc_stats["SSC"]["good"] += 1
+                elif station_info["SSC_flag"] == 3:
+                    qc_stats["SSC"]["bad"] += 1
+                elif station_info["SSC_flag"] == 9:
+                    qc_stats["SSC"]["missing"] += 1
+
+                # SSL
+                if station_info["SSL_flag"] == 0:
+                    qc_stats["SSL"]["good"] += 1
+                elif station_info["SSL_flag"] == 3:
+                    qc_stats["SSL"]["bad"] += 1
+                elif station_info["SSL_flag"] == 9:
+                    qc_stats["SSL"]["missing"] += 1
+
             else:
                 skipped_count += 1
         except Exception as e:
@@ -437,6 +460,7 @@ def main():
             import traceback
             traceback.print_exc()
             error_count += 1
+    
 
     print()
     print("="*80)
@@ -480,22 +504,17 @@ def main():
     print(f"Errors encountered: {error_count}")
     print(f"Output directory: {output_dir}")
     print()
+    print("\n" + "="*80)
+    print("Quality Control Outcome Summary (Station-level)")
     print("="*80)
-    print("Quality Control Summary")
-    print("="*80)
-    print("Quality Checks Applied:")
-    print("  Q (Discharge):")
-    print("    - Q < 0: Flagged as BAD (flag=3)")
-    print("    - Q == 0: Flagged as SUSPECT (flag=2)")
-    print("    - Q > 500,000 m³/s: Flagged as SUSPECT (flag=2)")
-    print("  SSC (Suspended Sediment Concentration):")
-    print("    - SSC < 0: Flagged as BAD (flag=3)")
-    print("    - SSC > 3000 mg/L: Flagged as SUSPECT (flag=2)")
-    print("  SSL (Suspended Sediment Load):")
-    print("    - SSL < 0: Flagged as BAD (flag=3)")
-    print("    - Valid SSL: Flagged as GOOD (flag=0)")
-    print("="*80)
-    print()
+    print(f"Total stations processed: {qc_stats['total_stations']}\n")
+
+    for var in ["Q", "SSC", "SSL"]:
+        print(f"{var}:")
+        print(f"  Good     : {qc_stats[var]['good']}")
+        print(f"  Bad      : {qc_stats[var]['bad']}")
+        print(f"  Missing  : {qc_stats[var]['missing']}")
+        print()
 
 
 if __name__ == '__main__':

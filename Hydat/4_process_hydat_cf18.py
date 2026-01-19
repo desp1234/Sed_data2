@@ -20,6 +20,142 @@ from datetime import datetime
 from pathlib import Path
 import warnings
 warnings.filterwarnings('ignore')
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import os
+import sys
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
+if PARENT_DIR not in sys.path:
+    sys.path.insert(0, PARENT_DIR)
+from tool import (
+    FILL_VALUE_FLOAT,
+    FILL_VALUE_INT,
+    apply_quality_flag,
+    compute_log_iqr_bounds,
+    build_ssc_q_envelope,
+    check_ssc_q_consistency,
+    plot_ssc_q_diagnostic,
+    convert_ssl_units_if_needed,
+    check_nc_completeness,
+    add_global_attributes,
+    propagate_ssc_q_inconsistency_to_ssl
+)
+
+def apply_tool_qc(
+    time,
+    Q,
+    SSC,
+    SSL,
+    station_id,
+    station_name,
+    plot_dir=None,
+    ):
+    """
+    Apply QC using functions from tool.py (local wrapper).
+
+    Rules
+    -----
+    - Physical checks: apply_quality_flag
+    - Statistical screening: log-IQR (Q, SSC only)
+    - Hydrological consistency: SSC–Q envelope
+    - Valid time: keep days where ANY of Q/SSC/SSL is not missing
+    """
+
+    n = len(time)
+
+    # -----------------------------
+    # 1. Physical QC (baseline)
+    # -----------------------------
+    Q_flag = np.array([apply_quality_flag(v, "Q") for v in Q], dtype=np.int8)
+    SSC_flag = np.array([apply_quality_flag(v, "SSC") for v in SSC], dtype=np.int8)
+    SSL_flag = np.array([apply_quality_flag(v, "SSL") for v in SSL], dtype=np.int8)
+
+    # -----------------------------
+    # 2. log-IQR screening
+    #    (only independent vars)
+    # -----------------------------
+    q_bounds = compute_log_iqr_bounds(Q)
+    if q_bounds[0] is not None:
+        Q_flag[(Q < q_bounds[0]) | (Q > q_bounds[1])] = 2
+
+    ssc_bounds = compute_log_iqr_bounds(SSC)
+    if ssc_bounds[0] is not None:
+        SSC_flag[(SSC < ssc_bounds[0]) | (SSC > ssc_bounds[1])] = 2
+
+    # -----------------------------
+    # 3. SSC–Q consistency check
+    # -----------------------------
+    ssc_q_bounds = build_ssc_q_envelope(Q, SSC)
+
+    if ssc_q_bounds is not None:
+        for i in range(n):
+            inconsistent, _ = check_ssc_q_consistency(
+                Q[i], SSC[i],
+                Q_flag[i], SSC_flag[i],
+                ssc_q_bounds
+            )
+
+            if inconsistent:
+                SSC_flag[i] = 2
+                SSL_flag[i] = propagate_ssc_q_inconsistency_to_ssl(
+                    inconsistent=inconsistent,
+                    Q=Q[i],
+                    SSC=SSC[i],
+                    SSL=SSL[i],
+                    Q_flag=Q_flag[i],
+                    SSC_flag=SSC_flag[i],
+                    SSL_flag=SSL_flag[i],
+                    ssl_is_derived_from_q_ssc=True  # ← 这里你可以控制
+                )
+
+
+    # -----------------------------
+    # 4. Valid-time mask
+    #    ANY variable non-missing
+    # -----------------------------
+    valid_time = (
+        (Q_flag != FILL_VALUE_INT)
+        | (SSC_flag != FILL_VALUE_INT)
+        | (SSL_flag != FILL_VALUE_INT)
+    )
+
+    if not np.any(valid_time):
+        return None
+
+    time = time[valid_time]
+    Q = Q[valid_time]
+    SSC = SSC[valid_time]
+    SSL = SSL[valid_time]
+    Q_flag = Q_flag[valid_time]
+    SSC_flag = SSC_flag[valid_time]
+    SSL_flag = SSL_flag[valid_time]
+
+    # -----------------------------
+    # 5. Diagnostic plot (optional)
+    # -----------------------------
+    if plot_dir is not None and ssc_q_bounds is not None:
+        plot_dir.mkdir(parents=True, exist_ok=True)
+        plot_ssc_q_diagnostic(
+            time=pd.to_datetime(time, unit="D", origin="1970-01-01"),
+            Q=Q,
+            SSC=SSC,
+            Q_flag=Q_flag,
+            SSC_flag=SSC_flag,
+            ssc_q_bounds=ssc_q_bounds,
+            station_id=station_id,
+            station_name=station_name,
+            out_png=plot_dir / f"{station_id}_ssc_q.png",
+        )
+
+    return {
+        "time": time,
+        "Q": Q,
+        "SSC": SSC,
+        "SSL": SSL,
+        "Q_flag": Q_flag,
+        "SSC_flag": SSC_flag,
+        "SSL_flag": SSL_flag,
+    }
 
 
 class HYDATQualityControl:
@@ -41,9 +177,9 @@ class HYDATQualityControl:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         # 物理阈值设置
-        self.Q_extreme_high = 100000.0  # m3/s - 极端高值
-        self.SSC_extreme_high = 3000.0  # mg/L - 极端高值
-        self.SSC_min = 0.1  # mg/L - 最小物理有效值
+        # self.Q_extreme_high = 100000.0  # m3/s - 极端高值
+        # self.SSC_extreme_high = 3000.0  # mg/L - 极端高值
+        # self.SSC_min = 0.1  # mg/L - 最小物理有效值
 
         # 统计信息
         self.stats = {
@@ -52,136 +188,6 @@ class HYDATQualityControl:
             'removed_stations': 0,
             'stations_info': []
         }
-
-    def check_physical_constraints(self, Q, SSC, SSL):
-        """
-        物理规律检查，生成质量标志
-
-        Parameters:
-        -----------
-        Q : numpy.ndarray
-            径流数据 (m3/s)
-        SSC : numpy.ndarray
-            泥沙浓度数据 (mg/L)
-        SSL : numpy.ndarray
-            输沙率数据 (ton/day)
-
-        Returns:
-        --------
-        Q_flag, SSC_flag, SSL_flag : numpy.ndarray
-            质量标志数组 (byte)
-            0 = Good data
-            1 = Estimated data
-            2 = Suspect data (zero/extreme)
-            3 = Bad data (negative)
-            9 = Missing data
-        """
-        n = len(Q)
-        Q_flag = np.full(n, 9, dtype=np.int8)  # 默认为缺失
-        SSC_flag = np.full(n, 9, dtype=np.int8)
-        SSL_flag = np.full(n, 9, dtype=np.int8)
-
-        # 检查 Q (径流)
-        for i in range(n):
-            if Q[i] == -9999.0 or np.isnan(Q[i]):
-                Q_flag[i] = 9  # Missing
-            elif Q[i] < 0:
-                Q_flag[i] = 3  # Bad data (negative)
-            elif Q[i] == 0:
-                Q_flag[i] = 2  # Suspect (zero flow - 可能是真实断流，也可能是测量问题)
-            elif Q[i] > self.Q_extreme_high:
-                Q_flag[i] = 2  # Suspect (extreme high)
-            else:
-                Q_flag[i] = 0  # Good data
-
-        # 检查 SSC (泥沙浓度)
-        for i in range(n):
-            if SSC[i] == -9999.0 or np.isnan(SSC[i]):
-                SSC_flag[i] = 9  # Missing
-            elif SSC[i] < 0:
-                SSC_flag[i] = 3  # Bad data (negative)
-            elif SSC[i] < self.SSC_min:
-                SSC_flag[i] = 2  # Suspect (too low)
-            elif SSC[i] > self.SSC_extreme_high:
-                SSC_flag[i] = 2  # Suspect (extreme high)
-            else:
-                SSC_flag[i] = 0  # Good data
-
-        # 检查 SSL (输沙率)
-        for i in range(n):
-            if SSL[i] == -9999.0 or np.isnan(SSL[i]):
-                SSL_flag[i] = 9  # Missing
-            elif SSL[i] < 0:
-                SSL_flag[i] = 3  # Bad data (negative)
-            else:
-                SSL_flag[i] = 0  # Good data
-
-        return Q_flag, SSC_flag, SSL_flag
-
-    def find_valid_time_range(self, time, Q, SSC, SSL, Q_flag, SSC_flag, SSL_flag):
-        """
-        找到有效数据的时间范围
-        数据选取sediment或discharge有值的起始年份的第一个月到结束年份的12月
-
-        Parameters:
-        -----------
-        time : numpy.ndarray
-            时间数组 (days since 1970-01-01)
-        Q, SSC, SSL : numpy.ndarray
-            数据数组
-        Q_flag, SSC_flag, SSL_flag : numpy.ndarray
-            质量标志数组
-
-        Returns:
-        --------
-        start_idx, end_idx : int
-            有效数据的起止索引
-        has_valid_data : bool
-            是否有有效数据
-        """
-        # 找到所有有有效数据的索引（flag != 9，即非缺失）
-        valid_Q = (Q_flag != 9)
-        valid_SSC = (SSC_flag != 9)
-        valid_SSL = (SSL_flag != 9)
-
-        # 任意变量有值即可
-        valid_any = valid_Q | valid_SSC | valid_SSL
-
-        if not np.any(valid_any):
-            return 0, 0, False
-
-        # 找到第一个和最后一个有效数据的位置
-        valid_indices = np.where(valid_any)[0]
-        first_valid_idx = valid_indices[0]
-        last_valid_idx = valid_indices[-1]
-
-        # 转换时间到日期
-        reference_date = pd.Timestamp('1970-01-01')
-        first_date = reference_date + pd.Timedelta(days=float(time[first_valid_idx]))
-        last_date = reference_date + pd.Timedelta(days=float(time[last_valid_idx]))
-
-        # 起始年份第一个月的第一天
-        start_date = pd.Timestamp(year=first_date.year, month=1, day=1)
-        # 结束年份最后一个月的最后一天
-        end_date = pd.Timestamp(year=last_date.year, month=12, day=31)
-
-        # 找到对应的索引范围
-        start_idx = 0
-        end_idx = len(time) - 1
-
-        for i in range(len(time)):
-            date_i = reference_date + pd.Timedelta(days=float(time[i]))
-            if date_i >= start_date:
-                start_idx = i
-                break
-
-        for i in range(len(time) - 1, -1, -1):
-            date_i = reference_date + pd.Timedelta(days=float(time[i]))
-            if date_i <= end_date:
-                end_idx = i
-                break
-
-        return start_idx, end_idx + 1, True  # end_idx+1 因为切片是左闭右开
 
     def calculate_completeness(self, data_array, flag_array, start_date, end_date):
         """
@@ -283,28 +289,29 @@ class HYDATQualityControl:
                 else:
                     raise ValueError("Cannot find sediment load variable")
 
-                # 物理规律检查，生成质量标志
-                Q_flag, SSC_flag, SSL_flag = self.check_physical_constraints(Q, SSC, SSL)
-
-                # 找到有效时间范围
-                start_idx, end_idx, has_valid = self.find_valid_time_range(
-                    time, Q, SSC, SSL, Q_flag, SSC_flag, SSL_flag
+                qc = apply_tool_qc(
+                    time=time,
+                    Q=Q,
+                    SSC=SSC,
+                    SSL=SSL,
+                    station_id=station_id,
+                    station_name=station_name,
+                    plot_dir=self.output_dir / "diagnostic_plots",
                 )
 
-                if not has_valid:
-                    print(f"  ⚠ 警告: 站点 {station_id} 无有效数据，跳过")
-                    self.stats['removed_stations'] += 1
+                if qc is None:
+                    print(f"  ⚠ No valid data after QC, skip station {station_id}")
                     return False, None
 
-                # 截取有效时间范围
-                time = time[start_idx:end_idx]
-                Q = Q[start_idx:end_idx]
-                SSC = SSC[start_idx:end_idx]
-                SSL = SSL[start_idx:end_idx]
-                Q_flag = Q_flag[start_idx:end_idx]
-                SSC_flag = SSC_flag[start_idx:end_idx]
-                SSL_flag = SSL_flag[start_idx:end_idx]
+                time = qc["time"]
+                Q = qc["Q"]
+                SSC = qc["SSC"]
+                SSL = qc["SSL"]
+                Q_flag = qc["Q_flag"]
+                SSC_flag = qc["SSC_flag"]
+                SSL_flag = qc["SSL_flag"]
 
+                
                 # 计算时间范围
                 reference_date = pd.Timestamp('1970-01-01')
                 start_date = reference_date + pd.Timedelta(days=float(time[0]))
@@ -429,16 +436,18 @@ class HYDATQualityControl:
                     ds_out.station_name = station_name
                     river_name = station_name.split(' AT ')[0] if ' AT ' in station_name else station_name.split(' NEAR ')[0] if ' NEAR ' in station_name else ''
                     ds_out.river_name = river_name
-                    ds_out.Source_ID = station_id
+                    ds_out.location_id = station_id
                     ds_out.Type = 'In-situ station data'
-                    ds_out.temporal_resolution = 'daily'
-                    ds_out.temporal_span = f"{start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}"
-                    ds_out.geographic_coverage = f"{province}, Canada"
+                    ds_out.Temporal_Resolution = 'daily'
+                    ds_out.Temporal_Span = f"{start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}"
+                    ds_out.Variables_Provided = 'altitude, upstream_area, Q, SSC, SSL'
+                    ds_out.Geographic_Coverage = f"{province}, Canada"
+                    ds_out.country = 'Canada'
+                    ds_out.continent_region = 'North America'
                     ds_out.time_coverage_start = start_date.strftime('%Y-%m-%d')
                     ds_out.time_coverage_end = end_date.strftime('%Y-%m-%d')
-                    ds_out.variables_provided = 'altitude, upstream_area, Q, SSC, SSL'
                     ds_out.number_of_data = '1'
-                    ds_out.reference = 'HYDAT - Canadian Hydrometric Database, Water Survey of Canada'
+                    ds_out.Reference = 'HYDAT - Canadian Hydrometric Database, Water Survey of Canada'
                     ds_out.source_data_link = 'https://www.canada.ca/en/environment-climate-change/services/water-overview/quantity/monitoring/survey/data-products-services/national-archive-hydat.html'
                     ds_out.creator_name = 'Zhongwang Wei'
                     ds_out.creator_email = 'weizhw6@mail.sysu.edu.cn'
@@ -461,12 +470,40 @@ class HYDATQualityControl:
                     ds_out.date_created = datetime.now().strftime('%Y-%m-%d')
                     ds_out.date_modified = datetime.now().strftime('%Y-%m-%d')
                     ds_out.processing_level = 'Quality controlled and standardized'
-                    ds_out.comment = (
-                        f"Data quality flags indicate reliability: 0=good, 1=estimated, 2=suspect, 3=bad, 9=missing. "
-                        f"Quality control applied: Q<0 flagged as bad, Q=0 flagged as suspect, Q>{self.Q_extreme_high} flagged as suspect; "
-                        f"SSC<0 flagged as bad, SSC<{self.SSC_min} or SSC>{self.SSC_extreme_high} flagged as suspect; "
-                        f"SSL<0 flagged as bad."
-                    )
+                    # ds_out.comment = (
+                    #     f"Data quality flags indicate reliability: 0=good, 1=estimated, 2=suspect, 3=bad, 9=missing. "
+                    #     f"Quality control applied: Q<0 flagged as bad, Q=0 flagged as suspect, Q>{self.Q_extreme_high} flagged as suspect; "
+                    #     f"SSC<0 flagged as bad, SSC<{self.SSC_min} or SSC>{self.SSC_extreme_high} flagged as suspect; "
+                    #     f"SSL<0 flagged as bad."
+                    # )
+                # ==========================================================
+                # NetCDF completeness check (CF-1.8 / ACDD-1.3)
+                # ==========================================================
+                # errors, warnings = check_nc_completeness(output_file, strict=True)
+
+                # if errors:
+                #     print(f"  ✗ NetCDF completeness check FAILED for {station_id}")
+                #     for e in errors:
+                #         print(f"    ERROR: {e}")
+
+                #     # 可选：删除不合格文件
+                #     try:
+                #         output_file.unlink()
+                #         print(f"    → Invalid NetCDF removed: {output_file.name}")
+                #     except Exception:
+                #         pass
+
+                #     return False, None
+
+                #     if warnings:
+                #         with nc.Dataset(output_file, "a") as ds_out:
+                #             ds_out.history = (
+                #                 ds_out.history
+                #                 + f"; {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}: "
+                #                 f"Completeness check warnings: {len(warnings)} issues"
+                #             )
+
+
 
                 # 收集站点信息用于CSV
                 station_info = {
@@ -508,31 +545,42 @@ class HYDATQualityControl:
             traceback.print_exc()
             return False, None
 
+
+
     def process_all_stations(self):
-        """处理所有站点"""
+        """并行处理所有站点"""
+
         print(f"\n{'='*80}")
-        print(f"HYDAT 数据集质量控制和CF-1.8标准化处理")
+        print(f"HYDAT 数据集质量控制和CF-1.8标准化处理 (并行加速版)")
         print(f"{'='*80}\n")
 
-        # 获取所有输入文件
         input_files = sorted(self.input_dir.glob('HYDAT_*_SEDIMENT.nc'))
         self.stats['total_stations'] = len(input_files)
 
         print(f"找到 {len(input_files)} 个站点文件")
+        print(f"使用 CPU 核心数: {os.cpu_count()} 并行处理\n")
         print(f"输入目录: {self.input_dir}")
         print(f"输出目录: {self.output_dir}")
         print(f"{'='*80}\n")
 
-        # 处理每个站点
-        for i, input_file in enumerate(input_files, 1):
-            print(f"\n[{i}/{len(input_files)}] ", end='')
-            success, station_info = self.process_station(input_file)
+        results = []
 
-            if success and station_info:
-                self.stats['stations_info'].append(station_info)
+        # ★★★ 并行执行 ★★★
+        with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
+            future_to_station = {executor.submit(self.process_station, f): f for f in input_files}
+
+            for future in as_completed(future_to_station):
+                success, station_info = future.result()
+                if success and station_info:
+                    results.append(station_info)
+
+        # === 更新统计信息 ===
+        self.stats['processed_stations'] = len(results)
+        self.stats['removed_stations'] = self.stats['total_stations'] - len(results)
+        self.stats['stations_info'] = results
 
         print(f"\n{'='*80}")
-        print(f"处理完成!")
+        print(f"处理完成! (并行)")
         print(f"{'='*80}")
         print(f"总站点数: {self.stats['total_stations']}")
         print(f"成功处理: {self.stats['processed_stations']}")
@@ -571,8 +619,8 @@ class HYDATQualityControl:
 def main():
     """主函数"""
     # 设置路径
-    input_dir = Path('/Users/zhongwangwei/Downloads/Sediment/Output/daily/HYDAT')
-    output_dir = Path('/Users/zhongwangwei/Downloads/Sediment/Output_r/daily/HYDAT')
+    input_dir = Path('/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Output_r/daily/HYDAT/sediment_update/')
+    output_dir = Path('/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Output_r/daily/HYDAT/output_update/')
     csv_file = output_dir / 'HYDAT_station_summary.csv'
 
     # 创建处理对象

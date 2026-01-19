@@ -26,15 +26,33 @@ import netCDF4 as nc
 from datetime import datetime
 import os
 import warnings
+import sys
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
+if PARENT_DIR not in sys.path:
+    sys.path.insert(0, PARENT_DIR)
+from tool import (
+    FILL_VALUE_FLOAT,
+    FILL_VALUE_INT,
+    apply_quality_flag,
+    compute_log_iqr_bounds,
+    build_ssc_q_envelope,
+    check_ssc_q_consistency,
+    plot_ssc_q_diagnostic,
+    convert_ssl_units_if_needed,
+    check_nc_completeness,
+    add_global_attributes
+)
+
 
 # --- CONFIGURATION ---
 
 # Input and Output directories
 # Assumes the script is run from the 'Script/Dataset/Mekong_Delta' directory
-BASE_DIR = "/Users/zhongwangwei/Downloads/Sediment"
+BASE_DIR = "/share/home/dq134/wzx/sed_data/sediment_wzx_1111/"
 SOURCE_DATA_DIR = os.path.join(BASE_DIR, "Source/Mekong_Delta/data")
-TARGET_NC_DIR = os.path.join(BASE_DIR, "Output_r/daily/Mekong_Delta")
-TARGET_CSV_PATH = os.path.join(BASE_DIR, "Output_r/daily/Mekong_Delta")
+TARGET_NC_DIR = os.path.join(BASE_DIR, "Output_r/daily/Mekong_Delta/qc")
+TARGET_CSV_PATH = os.path.join(BASE_DIR, "Output_r/daily/Mekong_Delta/qc")
 
 # Station metadata
 STATIONS = {
@@ -56,9 +74,6 @@ STATIONS = {
     }
 }
 
-# QC Thresholds
-Q_EXTREME_HIGH = 50000  # m3/s, an example threshold
-SSC_EXTREME_HIGH = 3000  # mg/L
 
 # --- HELPER FUNCTIONS ---
 
@@ -113,40 +128,6 @@ def calculate_ssc_from_ssl(df):
     ssc[~np.isfinite(ssc)] = np.nan
     return ssc
 
-def apply_quality_control(df):
-    """
-    Apply quality control checks and generate flag variables.
-    Flag meanings: 0=Good, 2=Suspect, 3=Bad, 9=Missing.
-    """
-    # Initialize flags with 0 (Good data)
-    df['Q_flag'] = np.int8(0)
-    df['SSC_flag'] = np.int8(0)
-    df['SSL_flag'] = np.int8(0)
-
-    # --- Flagging Logic ---
-    # Rule: Negative values are "Bad data"
-    df.loc[df['Q'] < 0, 'Q_flag'] = 3
-    df.loc[df['SSC'] < 0.1, 'SSC_flag'] = 3 # As per user request
-    df.loc[df['SSL'] < 0, 'SSL_flag'] = 3
-
-    # Rule: Zero discharge is "Suspect"
-    df.loc[df['Q'] == 0, 'Q_flag'] = 2
-
-    # Rule: Extreme high values are "Suspect"
-    df.loc[df['Q'] > Q_EXTREME_HIGH, 'Q_flag'] = 2
-    df.loc[df['SSC'] > SSC_EXTREME_HIGH, 'SSC_flag'] = 2
-
-    # Rule: Where original data is missing, flag is "Missing"
-    df.loc[df['Q'].isna(), 'Q_flag'] = 9
-    df.loc[df['SSC'].isna(), 'SSC_flag'] = 9
-    df.loc[df['SSL'].isna(), 'SSL_flag'] = 9
-    
-    # Set data to NaN where it's bad
-    df.loc[df['Q_flag'] == 3, 'Q'] = np.nan
-    df.loc[df['SSC_flag'] == 3, 'SSC'] = np.nan
-    df.loc[df['SSL_flag'] == 3, 'SSL'] = np.nan
-
-    return df
 
 def get_summary_stats(df, var_name):
     """Calculate summary statistics for a variable."""
@@ -167,6 +148,106 @@ def get_summary_stats(df, var_name):
     
     return start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'), round(percent_complete, 2)
 
+def apply_tool_qc(
+    time,
+    Q,
+    SSC,
+    SSL,
+    station_id,
+    station_name,
+    plot_dir=None,
+):
+    """
+    Apply QC using tool.py logic:
+    - Physical checks (apply_quality_flag)
+    - Log-IQR screening (Q, SSC only)
+    - SSC–Q hydrological consistency
+    """
+
+    n = len(time)
+
+    # -----------------------------
+    # 1. Physical QC (baseline)
+    # -----------------------------
+    Q_flag = np.array([apply_quality_flag(v, "Q") for v in Q], dtype=np.int8)
+    SSC_flag = np.array([apply_quality_flag(v, "SSC") for v in SSC], dtype=np.int8)
+    SSL_flag = np.array([apply_quality_flag(v, "SSL") for v in SSL], dtype=np.int8)
+
+    # -----------------------------
+    # 2. log-IQR screening
+    #    (independent variables only)
+    # -----------------------------
+    q_bounds = compute_log_iqr_bounds(Q)
+    if q_bounds[0] is not None:
+        Q_flag[(Q < q_bounds[0]) | (Q > q_bounds[1])] = 2
+
+    ssc_bounds = compute_log_iqr_bounds(SSC)
+    if ssc_bounds[0] is not None:
+        SSC_flag[(SSC < ssc_bounds[0]) | (SSC > ssc_bounds[1])] = 2
+
+    # -----------------------------
+    # 3. SSC–Q consistency check
+    # -----------------------------
+    ssc_q_bounds = build_ssc_q_envelope(Q, SSC)
+
+    if ssc_q_bounds is not None:
+        for i in range(n):
+            inconsistent, _ = check_ssc_q_consistency(
+                Q[i], SSC[i],
+                Q_flag[i], SSC_flag[i],
+                ssc_q_bounds
+            )
+            if inconsistent:
+                SSC_flag[i] = 2
+
+    # -----------------------------
+    # 4. Keep valid times
+    # -----------------------------
+    valid = (
+        (Q_flag != FILL_VALUE_INT)
+        | (SSC_flag != FILL_VALUE_INT)
+        | (SSL_flag != FILL_VALUE_INT)
+    )
+
+    if not np.any(valid):
+        return None
+
+    time = time[valid]
+    Q = Q[valid]
+    SSC = SSC[valid]
+    SSL = SSL[valid]
+    Q_flag = Q_flag[valid]
+    SSC_flag = SSC_flag[valid]
+    SSL_flag = SSL_flag[valid]
+
+    # -----------------------------
+    # 5. Diagnostic plot (optional)
+    # -----------------------------
+    if plot_dir is not None and ssc_q_bounds is not None:
+        os.makedirs(plot_dir, exist_ok=True)
+        plot_ssc_q_diagnostic(
+            time=time,
+            Q=Q,
+            SSC=SSC,
+            Q_flag=Q_flag,
+            SSC_flag=SSC_flag,
+            ssc_q_bounds=ssc_q_bounds,
+            station_id=station_id,
+            station_name=station_name,
+            out_png=os.path.join(plot_dir, f"{station_id}_ssc_q.png"),
+        )
+
+    return {
+        "time": time,
+        "Q": Q,
+        "SSC": SSC,
+        "SSL": SSL,
+        "Q_flag": Q_flag,
+        "SSC_flag": SSC_flag,
+        "SSL_flag": SSL_flag,
+    }
+
+
 # --- MAIN PROCESSING ---
 
 def create_netcdf_file(filepath, df, station_meta):
@@ -186,8 +267,11 @@ def create_netcdf_file(filepath, df, station_meta):
         time_var.standard_name = "time"
         time_var.units = time_units
         time_var.calendar = "gregorian"
-        time_var[:] = nc.date2num(df['time'].dt.to_pydatetime(), units=time_units, calendar="gregorian")
-
+        # Avoid using `df['time'].dt.to_pydatetime()` which emits a FutureWarning
+        # Build a list of Python datetimes via individual Timestamp.to_pydatetime()
+        time_py = [t.to_pydatetime() for t in df['time'].tolist()]
+        time_var[:] = nc.date2num(time_py, units=time_units, calendar="gregorian")
+        
         # lat
         lat_var = ds.createVariable('lat', 'f4')
         lat_var.long_name = "station latitude"
@@ -325,7 +409,21 @@ def main():
             merged_df['SSC'] = calculate_ssc_from_ssl(merged_df)
             
             # Apply QC
-            qc_df = apply_quality_control(merged_df)
+            qc = apply_tool_qc(
+                time=merged_df['time'].values,
+                Q=merged_df['Q'].values,
+                SSC=merged_df['SSC'].values,
+                SSL=merged_df['SSL'].values,
+                station_id=station_meta['Source_ID'],
+                station_name=station_meta['name'],
+                plot_dir=os.path.join(TARGET_NC_DIR, "diagnostic_plots"),
+            )
+
+            if qc is None:
+                warnings.warn(f"No valid data after QC for station {station_id}. Skipping.")
+                continue
+
+            qc_df = pd.DataFrame(qc)
 
             # Truncate time series
             valid_df = qc_df.dropna(subset=['Q', 'SSC', 'SSL'], how='all')
@@ -378,7 +476,22 @@ def main():
             output_filename = f"Mekong_Delta_{station_id}.nc"
             output_filepath = os.path.join(TARGET_NC_DIR, output_filename)
             create_netcdf_file(output_filepath, final_df, station_meta)
-            print(f"  Successfully created {output_filepath}")
+
+            # errors, warnings_nc = check_nc_completeness(output_filepath, strict=True)
+
+            # if errors:
+            #     print(f"✗ Completeness check failed for {station_id}")
+            #     for e in errors:
+            #         print(f"  ERROR: {e}")
+            #     os.remove(output_filepath)
+            #     continue
+
+            # if warnings_nc:
+            #     print(f"⚠ Completeness warnings for {station_id}")
+            #     for w in warnings_nc:
+            #         print(f"  WARNING: {w}")
+
+            # print(f"  Successfully created {output_filepath}")
 
         except FileNotFoundError as e:
             warnings.warn(f"Data file not found for station {station_id}: {e}. Skipping.")

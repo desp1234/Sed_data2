@@ -378,8 +378,8 @@ def main():
     print("="*70)
 
     # Set up paths
-    base_dir = "/Users/zhongwangwei/Downloads/7808492/evandethier_2022_global_sediment_flux_required_sediment_files"
-    output_dir = "/Users/zhongwangwei/Downloads/7808492/netcdf_output"
+    base_dir = "/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/Milliman/evandethier_2022_global_sediment_flux_required_sediment_files"
+    output_dir = "/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/Milliman/netcdf_output"
 
     # Create output directory
     create_output_directory(output_dir)

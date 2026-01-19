@@ -29,18 +29,29 @@ import netCDF4 as nc
 from datetime import datetime
 import os
 import warnings
+import sys
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
+if PARENT_DIR not in sys.path:
+    sys.path.insert(0, PARENT_DIR)
+from tool import (
+    FILL_VALUE_FLOAT,
+    FILL_VALUE_INT,
+    apply_quality_flag,
+    compute_log_iqr_bounds,
+    build_ssc_q_envelope,
+    check_ssc_q_consistency,
+    plot_ssc_q_diagnostic,
+    check_nc_completeness,
+)
 
 # --- CONFIGURATION ---
 
 # Input and Output directories from user request
-BASE_DIR = "/Users/zhongwangwei/Downloads/Sediment"
+BASE_DIR = "/share/home/dq134/wzx/sed_data/sediment_wzx_1111/"
 SOURCE_DATA_DIR = os.path.join(BASE_DIR, "Source/Myanmar")
-TARGET_NC_DIR = os.path.join(BASE_DIR, "Output_r/daily/Myanmar")
-TARGET_CSV_PATH = os.path.join(BASE_DIR, "Output_r/daily/Myanmar")
-
-# QC Thresholds
-Q_EXTREME_HIGH = 50000  # m3/s, for Irrawaddy, based on literature
-SSC_EXTREME_HIGH = 4000 # mg/L, slightly higher than Mekong due to regional characteristics
+TARGET_NC_DIR = os.path.join(BASE_DIR, "Output_r/daily/Myanmar/qc")
+TARGET_CSV_PATH = os.path.join(BASE_DIR, "Output_r/daily/Myanmar/qc")
 
 # --- HELPER FUNCTIONS ---
 
@@ -60,38 +71,104 @@ def calculate_ssl(q, ssc):
         return np.nan
     return q * ssc * 0.0864
 
-def apply_quality_control(df):
+def apply_tool_qc(
+    time,
+    Q,
+    SSC,
+    SSL,
+    station_id,
+    station_name,
+    plot_dir=None,
+):
     """
-    Apply quality control checks and generate CF-compliant flag variables.
-    Flag meanings: 0=Good, 2=Suspect, 3=Bad, 9=Missing.
+    Apply QC using tool.py logic:
+    - Physical checks (apply_quality_flag)
+    - log-IQR screening (Q, SSC only)
+    - SSC–Q hydrological consistency
     """
-    df['Q_flag'] = np.int8(0)
-    df['SSC_flag'] = np.int8(0)
-    df['SSL_flag'] = np.int8(0)
 
-    # Rule: Negative values are "Bad data"
-    df.loc[df['Q'] < 0, 'Q_flag'] = 3
-    df.loc[df['SSC'] < 0.1, 'SSC_flag'] = 3
-    df.loc[df['SSL'] < 0, 'SSL_flag'] = 3
+    n = len(time)
 
-    # Rule: Zero discharge is "Suspect"
-    df.loc[df['Q'] == 0, 'Q_flag'] = 2
+    # -----------------------------
+    # 1. Physical QC
+    # -----------------------------
+    Q_flag = np.array([apply_quality_flag(v, "Q") for v in Q], dtype=np.int8)
+    SSC_flag = np.array([apply_quality_flag(v, "SSC") for v in SSC], dtype=np.int8)
+    SSL_flag = np.array([apply_quality_flag(v, "SSL") for v in SSL], dtype=np.int8)
 
-    # Rule: Extreme high values are "Suspect"
-    df.loc[df['Q'] > Q_EXTREME_HIGH, 'Q_flag'] = 2
-    df.loc[df['SSC'] > SSC_EXTREME_HIGH, 'SSC_flag'] = 2
+    # -----------------------------
+    # 2. log-IQR screening
+    # -----------------------------
+    q_bounds = compute_log_iqr_bounds(Q)
+    if q_bounds[0] is not None:
+        Q_flag[(Q < q_bounds[0]) | (Q > q_bounds[1])] = 2
 
-    # Rule: Where data is missing, flag is "Missing"
-    df.loc[df['Q'].isna(), 'Q_flag'] = 9
-    df.loc[df['SSC'].isna(), 'SSC_flag'] = 9
-    df.loc[df['SSL'].isna(), 'SSL_flag'] = 9
+    ssc_bounds = compute_log_iqr_bounds(SSC)
+    if ssc_bounds[0] is not None:
+        SSC_flag[(SSC < ssc_bounds[0]) | (SSC > ssc_bounds[1])] = 2
 
-    # Set data to NaN where it's bad
-    df.loc[df['Q_flag'] == 3, 'Q'] = np.nan
-    df.loc[df['SSC_flag'] == 3, 'SSC'] = np.nan
-    df.loc[df['SSL_flag'] == 3, 'SSL'] = np.nan
+    # -----------------------------
+    # 3. SSC–Q consistency
+    # -----------------------------
+    ssc_q_bounds = build_ssc_q_envelope(Q, SSC)
 
-    return df
+    if ssc_q_bounds is not None:
+        for i in range(n):
+            inconsistent, _ = check_ssc_q_consistency(
+                Q[i], SSC[i],
+                Q_flag[i], SSC_flag[i],
+                ssc_q_bounds
+            )
+            if inconsistent:
+                SSC_flag[i] = 2
+
+    # -----------------------------
+    # 4. Keep valid times
+    # -----------------------------
+    valid = (
+        (Q_flag != FILL_VALUE_INT)
+        | (SSC_flag != FILL_VALUE_INT)
+        | (SSL_flag != FILL_VALUE_INT)
+    )
+
+    if not np.any(valid):
+        return None
+
+    time = time[valid]
+    Q = Q[valid]
+    SSC = SSC[valid]
+    SSL = SSL[valid]
+    Q_flag = Q_flag[valid]
+    SSC_flag = SSC_flag[valid]
+    SSL_flag = SSL_flag[valid]
+
+    # -----------------------------
+    # 5. Diagnostic plot (optional)
+    # -----------------------------
+    if plot_dir is not None and ssc_q_bounds is not None:
+        os.makedirs(plot_dir, exist_ok=True)
+        plot_ssc_q_diagnostic(
+            time=time,
+            Q=Q,
+            SSC=SSC,
+            Q_flag=Q_flag,
+            SSC_flag=SSC_flag,
+            ssc_q_bounds=ssc_q_bounds,
+            station_id=station_id,
+            station_name=station_name,
+            out_png=os.path.join(plot_dir, f"{station_id}_ssc_q.png"),
+        )
+
+    return {
+        "time": time,
+        "Q": Q,
+        "SSC": SSC,
+        "SSL": SSL,
+        "Q_flag": Q_flag,
+        "SSC_flag": SSC_flag,
+        "SSL_flag": SSL_flag,
+    }
+
 
 def get_summary_stats(df, var_name):
     """Calculate summary statistics for a variable."""
@@ -127,7 +204,13 @@ def create_netcdf_file(filepath, df, station_meta):
         time_var.standard_name = "time"
         time_var.units = time_units
         time_var.calendar = "gregorian"
-        time_var[:] = nc.date2num(df['time'].dt.to_pydatetime(), units=time_units, calendar="gregorian")
+        # ---- time handling (SAFE) ----
+        # Convert series to list of python datetimes to avoid Series.to_pydatetime()/dt.to_pydatetime issues
+        time_series = pd.to_datetime(df['time'])
+        time_py = [t.to_pydatetime() for t in time_series.tolist()]
+
+        time_var[:] = nc.date2num(time_py, units=time_units, calendar="gregorian")
+
 
         lat_var = ds.createVariable('lat', 'f4')
         lat_var.long_name = "station latitude"
@@ -281,7 +364,22 @@ def main():
         merged_df['SSL'] = merged_df.apply(lambda row: calculate_ssl(row['Q'], row['SSC']), axis=1)
 
         # Apply QC
-        qc_df = apply_quality_control(merged_df)
+        qc = apply_tool_qc(
+            time=merged_df['time'].values,
+            Q=merged_df['Q'].values,
+            SSC=merged_df['SSC'].values,
+            SSL=merged_df['SSL'].values,
+            station_id=station_id,
+            station_name=station_id.replace('_', ' '),
+            plot_dir=os.path.join(TARGET_NC_DIR, "diagnostic_plots"),
+        )
+
+        if qc is None:
+            warnings.warn(f"No valid data for station {station_id} after QC. Skipping.")
+            continue
+
+        qc_df = pd.DataFrame(qc)
+
 
         # --- MODIFIED LOGIC: NO PADDING ---
         # Filter to only rows that have at least one valid data point
@@ -291,6 +389,20 @@ def main():
         if final_df.empty:
             warnings.warn(f"No valid data for station {station_id} after QC. Skipping.")
             continue
+        # --- 打印每个站点经过质量控制后的 flag 情况（仅打印，不写入文件） ---
+        print(f"  QC flags summary for station: {station_id}")
+        for flag_col in ['Q_flag', 'SSC_flag', 'SSL_flag']:
+            if flag_col in final_df.columns:
+                vals, counts = np.unique(final_df[flag_col].values, return_counts=True)
+                counts_str = ", ".join([f"{int(v)}:{int(c)}" for v, c in zip(vals, counts)])
+                print(f"    {flag_col}: {counts_str}")
+            else:
+                print(f"    {flag_col}: (missing)")
+        # 打印前 5 行示例（time 与 flags）
+        sample_cols = [c for c in ['time', 'Q_flag', 'SSC_flag', 'SSL_flag'] if c in final_df.columns]
+        if sample_cols:
+            print(final_df[sample_cols].head(5).to_string(index=False))
+        print("")
         # --- END OF MODIFICATION ---
 
         # Get metadata for this station
