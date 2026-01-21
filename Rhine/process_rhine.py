@@ -18,8 +18,8 @@ from tool import (
     check_ssc_q_consistency,
     plot_ssc_q_diagnostic,
     convert_ssl_units_if_needed,
-    check_nc_completeness,
-    add_global_attributes
+    # check_nc_completeness,
+    # add_global_attributes
 )
 
 
