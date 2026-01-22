@@ -114,7 +114,16 @@ def create_station_netcdf(row, idx, output_dir, input_file,ssl_iqr_bounds, ssc_q
 
     if ssc_q_inconsistent and SSC_flag == 0:
         SSC_flag = np.int8(2)  # suspect
-
+        SSL_flag = propagate_ssc_q_inconsistency_to_ssl(
+            inconsistent=ssc_q_inconsistent,
+            Q=Q,
+            SSC=SSC,
+            SSL=SSL,
+            Q_flag=Q_flag,
+            SSC_flag=SSC_flag,
+            SSL_flag=SSL_flag,
+            ssl_is_derived_from_q_ssc=True,  
+        ) #lcz added
 
     # Calculate time (middle of period)
     if start_year and end_year:
