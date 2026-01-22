@@ -68,7 +68,7 @@ def log_station_qc(site_name, site_code=None, n=None,
     if created_path:
         print(f"  ✓ Created: {created_path}")
 
-    # values + flags
+    # values + flag
     if q is not None or q_flag is not None:
         print(f"  Q:   {fmt_float(q)} m3/s (flag={q_flag})")
     if ssc is not None or ssc_flag is not None:
