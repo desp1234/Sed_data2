@@ -124,7 +124,7 @@ def create_station_netcdf(row, idx, output_dir, input_file,ssl_iqr_bounds, ssc_q
             SSC_flag=SSC_flag,
             SSL_flag=SSL_flag,
             ssl_is_derived_from_q_ssc=True,  
-        ) #lcz add
+        ) #lcz added
 
     # Calculate time (middle of period)
     if start_year and end_year:

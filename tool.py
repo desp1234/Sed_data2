@@ -601,4 +601,3 @@ def generate_station_summary_csv(station_data, output_dir):
     print(f"\nCreated station summary CSV: {csv_file}")
 
     return csv_file
-
