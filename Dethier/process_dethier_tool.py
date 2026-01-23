@@ -33,7 +33,8 @@ from tool import (
     build_ssc_q_envelope,
     check_ssc_q_consistency,
     plot_ssc_q_diagnostic,
-    convert_ssl_units_if_needed
+    convert_ssl_units_if_needed,
+    propagate_ssc_q_inconsistency_to_ssl
 )
 
 
@@ -195,7 +196,32 @@ def compute_summary_stats(df: pd.DataFrame, var: str, flag_col: str):
         f"{var}_min": good_series.min(),
         f"{var}_max": good_series.max(),
     }
+def print_station_qc_summary(
+    station_id,
+    station_name,
+    n_samples,
+    skipped_log_iqr,
+    skipped_ssc_q,
+    q_value, q_flag,
+    ssc_value, ssc_flag,
+    ssl_value, ssl_flag,
+    created_nc_path
+):
+    """
+    打印单站点 QC 结果（面向人类阅读）
+    """
+    print(f"\nProcessing: {station_name} ({station_id})")
+    print(f"  Sample size = {n_samples}")
 
+    if skipped_log_iqr:
+        print("  ⚠ log-IQR statistical QC skipped (sample size < 5).")
+    if skipped_ssc_q:
+        print("  ⚠ SSC–Q consistency check skipped (sample size < 5).")
+
+    print(f"  ✓ Created: {os.path.basename(created_nc_path)}")
+    print(f"    Q   : {q_value:.2f} m3/s (flag={q_flag})")
+    print(f"    SSC : {ssc_value:.2f} mg/L (flag={ssc_flag})")
+    print(f"    SSL : {ssl_value:.2f} ton/day (flag={ssl_flag})")
 
 # =========================
 # 核心处理函数
@@ -393,8 +419,20 @@ def process_single_netcdf(nc_path: str, output_dir: str) -> dict | None:
             ssc_q_bounds=ssc_q_bounds
         )
 
-        if is_inconsistent and sscf == FLAG_GOOD:
-            sscf = FLAG_SUSPECT
+        if is_inconsistent:
+            if sscf == FLAG_GOOD:
+                sscf = np.int8(FLAG_SUSPECT)
+
+            sslf = propagate_ssc_q_inconsistency_to_ssl(
+                inconsistent=is_inconsistent,
+                Q=q,
+                SSC=ssc,
+                SSL=ssl,
+                Q_flag=qf,
+                SSC_flag=sscf,
+                SSL_flag=sslf,
+                ssl_is_derived_from_q_ssc=False,  # Dethier 这里一般设 False（保守）
+            )
 
         q_flag[i] = qf
         ssc_flag[i] = sscf
@@ -548,6 +586,23 @@ def process_single_netcdf(nc_path: str, output_dir: str) -> dict | None:
 
     ds_out.to_netcdf(out_path, format="NETCDF4", encoding=encoding)
     LOGGER.info("Saved standardized NetCDF: %s", out_path)
+    # =========================
+    # Print QC summary (console)
+    # =========================
+    print_station_qc_summary(
+        station_id=station_id,
+        station_name=ds_out.attrs["station_name"],
+        n_samples=len(df),
+        skipped_log_iqr=(len(df) < 5),
+        skipped_ssc_q=(len(df) < 5),
+        q_value=np.nanmean(df_final["Q"].values),
+        q_flag=int(np.nanmax(df_final["Q_flag"].values)),
+        ssc_value=np.nanmean(df_final["SSC"].values),
+        ssc_flag=int(np.nanmax(df_final["SSC_flag"].values)),
+        ssl_value=np.nanmean(df_final["SSL"].values),
+        ssl_flag=int(np.nanmax(df_final["SSL_flag"].values)),
+        created_nc_path=out_path
+    )
 
     # ---- 汇总信息用于 CSV ----
     stats_q = compute_summary_stats(df_final, "Q", "Q_flag")
@@ -628,7 +683,10 @@ def process_dethier_data_from_nc(input_nc_dir: str, output_dir: str, summary_csv
 # =========================
 
 if __name__ == "__main__":
-    INPUT_NC_DIR = "/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/Dethier/nc_convert"
-    OUTPUT_DIR = "/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Script/main_test/Dethier/Output_r"
-    SUMMARY_CSV = "/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Script/main_test/Dethier/Output_r/Dethier_station_summary.csv"
+    PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, "..", ".."))
+
+    INPUT_NC_DIR = os.path.join(PROJECT_ROOT, "Source", "Dethier", "nc_convert")
+    OUTPUT_DIR   = os.path.join(PROJECT_ROOT, "Output_r", "Dethier", "qc")
+    SUMMARY_CSV  = os.path.join(OUTPUT_DIR, "Dethier_station_summary.csv")
+
     process_dethier_data_from_nc(INPUT_NC_DIR, OUTPUT_DIR, SUMMARY_CSV)
