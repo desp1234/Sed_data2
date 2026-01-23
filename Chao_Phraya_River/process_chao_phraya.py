@@ -34,19 +34,20 @@ from tool import (
     compute_log_iqr_bounds,
     build_ssc_q_envelope,
     check_ssc_q_consistency,
-    plot_ssc_q_diagnostic
+    plot_ssc_q_diagnostic,
+    propagate_ssc_q_inconsistency_to_ssl
+)
+PROJECT_ROOT = os.path.abspath(os.path.join(PARENT_DIR, '..'))
+
+SOURCE_DATA_PATH = os.path.join(
+    PROJECT_ROOT, "Source", "Chao_Phraya_River", "Chao_Phraya_River.tab"
 )
 
+OUTPUT_DIR = os.path.join(
+    PROJECT_ROOT, "Output_r", "annually_climatology", "Chao_Phraya_River", "qc"
+)
 
-# --- Configuration ---
-
-# File paths
-# Note: These paths are relative to the script's execution directory.
-# The script assumes it is run from /Users/zhongwangwei/Downloads/Sediment/Script/Dataset/Chao_Phraya_River/
-SOURCE_DATA_PATH = "/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/Chao_Phraya_River/Chao_Phraya_River.tab"
-OUTPUT_DIR = "/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Output_r/annually_climatology/Chao_Phraya_River/qc/"
-SUMMARY_DIR = "/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Output_r/annually_climatology/Chao_Phraya_River/qc/"
-
+SUMMARY_DIR = OUTPUT_DIR
 
 # Constants for unit conversion
 SECONDS_PER_YEAR = 365.25 * 24 * 3600  # 31,557,600
@@ -135,7 +136,9 @@ def assign_quality_flags(df):
     df['SSL_flag'] = [apply_quality_flag(v, 'SSL') for v in df['SSL'].values]
     return df
 
+
 def apply_station_level_qc(station_df):
+    
     """
     Apply log-IQR and SSC–Q consistency QC using tool.py only.
     """
@@ -173,7 +176,7 @@ def apply_station_level_qc(station_df):
                 SSL_flag[i] = 2
 
         # SSC–Q consistency
-        inconsistent, _ = check_ssc_q_consistency(
+        is_inconsistent, _ = check_ssc_q_consistency(
             Q=Q[i],
             SSC=SSC[i],
             Q_flag=Q_flag[i],
@@ -181,12 +184,58 @@ def apply_station_level_qc(station_df):
             ssc_q_bounds=ssc_q_bounds
         )
 
-        if inconsistent and SSC_flag[i] == 0:
-            SSC_flag[i] = 2
+        if is_inconsistent:
+            # 1) SSC：一致性不通过 -> suspect
+            if SSC_flag[i] == 0:
+                SSC_flag[i] = np.int8(2)
+
+            # 2) SSL：根据规则选择性传播
+            SSL_flag[i] = propagate_ssc_q_inconsistency_to_ssl(
+                inconsistent=is_inconsistent,
+                Q=Q[i],
+                SSC=SSC[i],
+                SSL=SSL[i],
+                Q_flag=Q_flag[i],
+                SSC_flag=SSC_flag[i],
+                SSL_flag=SSL_flag[i],
+                ssl_is_derived_from_q_ssc=True,  #SSC 是由 Q 和 SSL 推出来的,所以这里设为 True。
+            )
+
 
     station_df['Q_flag'] = Q_flag
     station_df['SSC_flag'] = SSC_flag
     station_df['SSL_flag'] = SSL_flag
+    # --- Simple QC summary (for printing) ---
+    n_valid_ssc = int(np.isfinite(SSC).sum())
+    n_valid_ssl = int(np.isfinite(SSL).sum())
+
+    log_iqr_skipped = (n_valid_ssc < 5) or (n_valid_ssl < 5)
+    ssc_q_check_skipped = (n_valid_ssc < 5)
+
+    # Flag counts
+    q0 = int((Q_flag == 0).sum())
+    q2 = int((Q_flag == 2).sum())
+    q3 = int((Q_flag == 3).sum())
+    q9 = int((Q_flag == 9).sum())
+
+    s0 = int((SSC_flag == 0).sum())
+    s2 = int((SSC_flag == 2).sum())
+    s3 = int((SSC_flag == 3).sum())
+    s9 = int((SSC_flag == 9).sum())
+
+    l0 = int((SSL_flag == 0).sum())
+    l2 = int((SSL_flag == 2).sum())
+    l3 = int((SSL_flag == 3).sum())
+    l9 = int((SSL_flag == 9).sum())
+
+    # Attach to df attrs so main() can read without changing return type
+    station_df.attrs["log_iqr_skipped"] = log_iqr_skipped
+    station_df.attrs["ssc_q_check_skipped"] = ssc_q_check_skipped
+    station_df.attrs["flag_counts"] = {
+        "Q":   (q0, q2, q3, q9),
+        "SSC": (s0, s2, s3, s9),
+        "SSL": (l0, l2, l3, l9),
+    }
 
     return station_df
 
@@ -385,6 +434,44 @@ def main():
         if event in stations_with_sediment:
             station_data = df[df['event'] == event].copy()
             station_data = apply_station_level_qc(station_data)
+            # ---------- Print QC summary ----------
+            sid = meta["station_id"]
+            print(f"\nProcessing: {sid} +")
+
+            if station_data.attrs.get("log_iqr_skipped", False):
+                print(f"  | [{sid}] Sample size < 5, log-IQR statistical QC skipped.")
+            else:
+                print(f"  | [{sid}] log-IQR statistical QC applied.")
+
+            if station_data.attrs.get("ssc_q_check_skipped", False):
+                print(f"  | [{sid}] Sample size < 5, SSC–Q consistency check skipped.")
+            else:
+                print(f"  | [{sid}] SSC–Q consistency check and diagnostic plot.")
+
+            # Representative values (mean of flag==0, fallback to mean of all finite)
+            def _rep(x, f):
+                x = x.astype(float)
+                good = (f == 0) & np.isfinite(x)
+                if good.any():
+                    return float(np.nanmean(x[good]))
+                return float(np.nanmean(x[np.isfinite(x)]))
+
+            q_rep   = _rep(station_data["Q"].values,   station_data["Q_flag"].values)
+            ssc_rep = _rep(station_data["SSC"].values, station_data["SSC_flag"].values)
+            ssl_rep = _rep(station_data["SSL"].values, station_data["SSL_flag"].values)
+
+            q0, q2, q3, q9 = station_data.attrs["flag_counts"]["Q"]
+            s0, s2, s3, s9 = station_data.attrs["flag_counts"]["SSC"]
+            l0, l2, l3, l9 = station_data.attrs["flag_counts"]["SSL"]
+
+            print(f"  ✓ Flags Q   (0/2/3/9): {q0}/{q2}/{q3}/{q9}")
+            print(f"  ✓ Flags SSC (0/2/3/9): {s0}/{s2}/{s3}/{s9}")
+            print(f"  ✓ Flags SSL (0/2/3/9): {l0}/{l2}/{l3}/{l9}")
+
+            print(f"  Q: {q_rep:.2f} m3/s (flag=0)")
+            print(f"  SSC: {ssc_rep:.2f} mg/L (flag=0)")
+            print(f"  SSL: {ssl_rep:.2f} ton/day (flag=0)")
+
 
             # =========================
             # SSC–Q diagnostic plot
@@ -442,6 +529,7 @@ def main():
     generate_summary_csv(df, stations, SUMMARY_DIR)
     
     print("---"" Processing Complete ---")
+
 
 if __name__ == "__main__":
     main()
