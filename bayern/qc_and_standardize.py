@@ -39,6 +39,7 @@ from tool import (
     calculate_ssc,
     build_ssc_q_envelope,
     check_ssc_q_consistency,
+    plot_ssc_q_diagnostic,
     propagate_ssc_q_inconsistency_to_ssl
 )
 
@@ -244,6 +245,22 @@ def process_station(input_file, output_dir):
             q_flags[i] = qf
             ssc_flags[i] = sscf
             ssl_flags[i] = sslf
+        # ==========================================================
+        # SSC–Q diagnostic plot (station-level, optional but recommended)
+        # ==========================================================
+        try:
+            plot_ssc_q_diagnostic(
+                Q_m3s=q_data,
+                SSC_mgL=ssc_data,
+                Q_flag=q_flags,
+                SSC_flag=ssc_flags,
+                ssc_q_bounds=ssc_q_bounds,
+                station_id=station_id,
+                station_name=station_name,
+                out_dir=output_dir
+            )
+        except Exception as e:
+            print(f"  ⚠️ Diagnostic plot failed for {station_id}: {e}")
 
         # Convert time to dates for reporting
         time_units = ds_in.variables['time'].units
