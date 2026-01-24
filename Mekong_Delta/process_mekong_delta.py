@@ -447,7 +447,6 @@ def main():
     station_summaries = []
 
     for station_id, station_meta in STATIONS.items():
-        print(f"Processing station: {station_id}...")
         try:
             # Read and merge data
             fluxes_df = read_fluxes_file(os.path.join(SOURCE_DATA_DIR, f'{station_id}fluxes.csv'))
