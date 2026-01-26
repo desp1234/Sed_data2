@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+import numpy.ma as ma
 import re
 import os
 import xarray as xr
@@ -157,6 +158,8 @@ def compute_log_iqr_bounds(values, k=1.5):
     tuple
         (lower_bound, upper_bound) in original space
     """
+    if ma.isMaskedArray(values):
+        values = ma.filled(values, np.nan)
     values = np.asarray(values, dtype=float)
     values = values[np.isfinite(values) & (values > 0)]
 
@@ -216,6 +219,8 @@ def apply_log_iqr_screening(
     bounds : tuple
         (lower, upper) bounds in original space; (None, None) if not computed.
     """
+    if ma.isMaskedArray(values):
+        values = ma.filled(values, np.nan)
     v = np.asarray(values, dtype=float)
     f = np.asarray(base_flag, dtype=np.int8)
     n = len(v)
@@ -265,19 +270,28 @@ def apply_quality_flag(value, variable_name):
     - Statistical outlier detection, if any, is handled separately.
     """
 
-    # Missing
-    if pd.isna(value) or np.isnan(value):
-        return np.int8(9)
-    # Check for fill value (-9999) before checking for negative values
-    # Use np.isclose to handle floating point precision issues
-    # Physical impossibility
-    if np.isclose(value, FILL_VALUE_FLOAT, rtol=1e-5, atol=1e-5):
+    # Robust missing/invalid handling:
+    # - netCDF often yields masked values (np.ma.masked / MaskedConstant)
+    # - some datasets may contain non-numeric objects
+    if value is None or ma.is_masked(value):
         return np.int8(9)
 
-    if value < 0:
+    # Convert to float safely; non-convertible values are treated as missing
+    try:
+        v = float(value)
+    except Exception:
+        return np.int8(9)
+
+    # Missing / fill / non-finite
+    if not np.isfinite(v):
+        return np.int8(9)
+    if np.isclose(v, float(FILL_VALUE_FLOAT), rtol=1e-5, atol=1e-5):
+        return np.int8(9)
+
+    # Physical impossibility
+    if v < 0:
         return np.int8(3)
 
-    # Otherwise good
     return np.int8(0)
 
 def build_ssc_q_envelope(
