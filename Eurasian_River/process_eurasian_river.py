@@ -31,7 +31,9 @@ from tool import (
     check_ssc_q_consistency,
     plot_ssc_q_diagnostic,
     convert_ssl_units_if_needed,
-    propagate_ssc_q_inconsistency_to_ssl
+    propagate_ssc_q_inconsistency_to_ssl,
+    apply_quality_flag_array,        
+    apply_hydro_qc_with_provenance, 
 )
 # --- Configuration ---
 BASE_DIR = os.path.abspath(os.path.join(CURRENT_DIR, "..", ".."))
@@ -284,61 +286,53 @@ def main():
 
         # --- Quality Control and Flagging ---  
 
-        # =====================================
-        # SSL log-IQR bounds (station-level)
-        # =====================================
-        ssl_lower, ssl_upper = compute_log_iqr_bounds(
-            df['SSL'].values,
-            k=1.5)
-        # =====================================
-        # Apply initial quality flags     
-        # =====================================  
-        df['Q_flag'] = df['Q'].apply(lambda x: apply_quality_flag(x, 'Q'))
-        df['SSC_flag'] = df['SSC'].apply(lambda x: apply_quality_flag(x, 'SSC'))
-        df['SSL_flag'] = df['SSL'].apply(lambda x: apply_quality_flag(x, 'SSL'))
-        # =====================================
-        # Flag SSL outliers based on log-IQR bounds
-        # =====================================
-        if ssl_lower is not None and ssl_upper is not None:
-            is_outlier = (
-                (df['SSL'] < ssl_lower) |
-                (df['SSL'] > ssl_upper)
-            ) & (df['SSL_flag'] == 0)
+        # 1) QC1-array：显式调用
+        Q_flag_qc1   = apply_quality_flag_array(df["Q"].values,   "Q")
+        SSC_flag_qc1 = apply_quality_flag_array(df["SSC"].values, "SSC")
+        SSL_flag_qc1 = apply_quality_flag_array(df["SSL"].values, "SSL")
+        # 2) time days since 1970-01-01
+        time_days = (df.index - base).days.astype(float).to_numpy()
 
-            df.loc[is_outlier, 'SSL_flag'] = 2  # suspect
-        # =====================================
-        # SSC-Q consistency check
-        # =====================================
-        ssc_q_bounds = build_ssc_q_envelope(
-        Q_m3s=df['Q'].values,
-        SSC_mgL=df['SSC'].values,
-        k=1.5,
-        min_samples=5
+        # 3) 设置布尔参数
+        qc = apply_hydro_qc_with_provenance(
+            time=time_days,
+            Q=df["Q"].values.astype(float),
+            SSC=df["SSC"].values.astype(float),
+            SSL=df["SSL"].values.astype(float),
+            Q_is_independent=True,
+            SSC_is_independent=False,
+            SSL_is_independent=True,
+            ssl_is_derived_from_q_ssc=False,  
+            qc2_k=1.5,
+            qc2_min_samples=5,
+            qc3_k=1.5,
+            qc3_min_samples=5,
         )
 
-        for i, row in df.iterrows():
-            is_bad, resid = check_ssc_q_consistency(
-                Q=row['Q'],
-                SSC=row['SSC'],
-                Q_flag=row['Q_flag'],
-                SSC_flag=row['SSC_flag'],
-                ssc_q_bounds=ssc_q_bounds
-            )
+        if qc is None:
+            # 退回 QC1
+            df["Q_flag"]   = Q_flag_qc1
+            df["SSC_flag"] = SSC_flag_qc1
+            df["SSL_flag"] = SSL_flag_qc1
+            ssc_q_bounds = None
+        else:
+            # 注意：qc 返回的是“trimmed(valid_time)”后的数组 :contentReference[oaicite:6]{index=6}
+            # 所以这里要用 qc["time"] 去找回 df 的索引
+            qc_time = base + pd.to_timedelta(qc["time"], unit="D")
+            df = df.loc[qc_time].copy()
 
-            if is_bad and row['SSC_flag'] == 0:
-                df.at[i, 'SSC_flag'] = np.int8(2) 
+            df["Q_flag"]   = qc["Q_flag"]
+            df["SSC_flag"] = qc["SSC_flag"]
+            df["SSL_flag"] = qc["SSL_flag"]
 
-                df.at[i, 'SSL_flag'] = propagate_ssc_q_inconsistency_to_ssl(
-                    inconsistent=is_bad,
-                    Q=row['Q'],
-                    SSC=row['SSC'],
-                    SSL=row['SSL'],
-                    Q_flag=row['Q_flag'],
-                    SSC_flag=np.int8(2),             
-                    SSL_flag=row['SSL_flag'],
-                    ssl_is_derived_from_q_ssc=True,
-                )
+            ssc_q_bounds = qc.get("ssc_q_bounds", None)
 
+        print(
+            f"[QC] {station_id} QC1(good cnt): "
+            f"Q={(Q_flag_qc1==0).sum()}, SSC={(SSC_flag_qc1==0).sum()}, SSL={(SSL_flag_qc1==0).sum()} | "
+            f"Final(good cnt): Q={(df['Q_flag'].to_numpy()==0).sum()}, "
+            f"SSC={(df['SSC_flag'].to_numpy()==0).sum()}, SSL={(df['SSL_flag'].to_numpy()==0).sum()}"
+        )
 
         # --- Time Trimming ---
         df.dropna(how='all', subset=['Q', 'SSL', 'SSC'], inplace=True)
