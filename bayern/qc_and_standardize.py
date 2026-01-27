@@ -40,7 +40,9 @@ from tool import (
     build_ssc_q_envelope,
     check_ssc_q_consistency,
     plot_ssc_q_diagnostic,
-    propagate_ssc_q_inconsistency_to_ssl
+    propagate_ssc_q_inconsistency_to_ssl,
+    apply_quality_flag_array,        
+    apply_hydro_qc_with_provenance, 
 )
 
 def fmt_float(x, nd=2):
@@ -107,7 +109,7 @@ def find_valid_time_range(ds_in):
         Start and end indices for valid data range
     """
 
-    # Read time series data
+    # Read time series data 
     q_data = ds_in.variables['discharge'][:]
     ssc_data = ds_in.variables['ssc'][:]
     ssl_data = ds_in.variables['sediment_load'][:]
@@ -199,65 +201,55 @@ def process_station(input_file, output_dir):
             SSC_mgL=ssc_data,
             k=1.5
         )
+        # QC1-array（显式调用）：
+        Q_flag_qc1   = apply_quality_flag_array(q_data,  "Q")
+        SSC_flag_qc1 = apply_quality_flag_array(ssc_data,"SSC")
+        SSL_flag_qc1 = apply_quality_flag_array(ssl_data,"SSL")
+        # ==========================================================
+        qc = apply_hydro_qc_with_provenance(
+            time=time_data,  
+            Q=q_data,
+            SSC=ssc_data,
+            SSL=ssl_data,
+            Q_is_independent=True, # discharge is independent variable
+            SSC_is_independent=True, # ssc is independent variable
+            SSL_is_independent=True, # ssl is independent variable
+            ssl_is_derived_from_q_ssc=False,
+            qc2_k=1.5, 
+            qc2_min_samples=5,
+            qc3_k=1.5, 
+            qc3_min_samples=5,
+        )
+        print("[DBG] qc is None?", qc is None)   # <- 加在 if qc is None 之前
+        if qc is None:
+            return None
 
-        # ---- unified QC loop ----
-        # quality control 1st step: negative values and missing values
-        for i in range(len(q_data)):
-            qf = apply_quality_flag(q_data[i], 'Q')
-            sscf = apply_quality_flag(ssc_data[i], 'SSC')
-            sslf = apply_quality_flag(ssl_data[i], 'SSL')
 
-            # log-IQR statistical outliers → suspect
-            if ssc_lower and ssc_upper:
-                if np.isfinite(ssc_data[i]) and (ssc_data[i] < ssc_lower or ssc_data[i] > ssc_upper):
-                    if sscf == 0:
-                        sscf = np.int8(2)
+        # 把最终结果写回 flags 数组（后面统计/写文件都靠它）
+        q_flags   = qc["Q_flag"]
+        ssc_flags = qc["SSC_flag"]
+        ssl_flags = qc["SSL_flag"]
 
-            if ssl_lower and ssl_upper:
-                if np.isfinite(ssl_data[i]) and (ssl_data[i] < ssl_lower or ssl_data[i] > ssl_upper):
-                    if sslf == 0:
-                        sslf = np.int8(2)
-                        
-            # SSC–Q hydrological consistency (station-level, log–log envelope)
-            is_inconsistent, resid = check_ssc_q_consistency(
-                Q=q_data[i],
-                SSC=ssc_data[i],
-                Q_flag=qf,
-                SSC_flag=sscf,
-                ssc_q_bounds=ssc_q_bounds
-            )
+        print(
+            f"[QC] {station_id} QC1(good cnt): "
+            f"Q={(Q_flag_qc1==0).sum()}, SSC={(SSC_flag_qc1==0).sum()}, SSL={(SSL_flag_qc1==0).sum()} | "
+            f"Final(good cnt): Q={(q_flags==0).sum()}, SSC={(ssc_flags==0).sum()}, SSL={(ssl_flags==0).sum()}"
+        )
 
-            if is_inconsistent:
-                if sscf == 0:
-                    sscf = np.int8(2)
 
-                sslf = propagate_ssc_q_inconsistency_to_ssl(
-                    inconsistent=is_inconsistent,
-                    Q=q_data[i],
-                    SSC=ssc_data[i],
-                    SSL=ssl_data[i],
-                    Q_flag=qf,
-                    SSC_flag=sscf,
-                    SSL_flag=sslf,
-                    ssl_is_derived_from_q_ssc=False, 
-                )
-            
-            q_flags[i] = qf
-            ssc_flags[i] = sscf
-            ssl_flags[i] = sslf
         # ==========================================================
         # SSC–Q diagnostic plot (station-level, optional but recommended)
         # ==========================================================
         try:
             plot_ssc_q_diagnostic(
-                Q_m3s=q_data,
+                Q=q_data,
                 SSC_mgL=ssc_data,
                 Q_flag=q_flags,
                 SSC_flag=ssc_flags,
                 ssc_q_bounds=ssc_q_bounds,
                 station_id=station_id,
                 station_name=station_name,
-                out_dir=output_dir
+                out_png=output_dir
             )
         except Exception as e:
             print(f"  ⚠️ Diagnostic plot failed for {station_id}: {e}")

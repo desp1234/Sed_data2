@@ -5,7 +5,6 @@ import re
 import os
 import xarray as xr
 from netCDF4 import Dataset
-from collections import Counter
 
 FILL_VALUE_FLOAT = np.float32(-9999.0)
 FILL_VALUE_INT = np.int8(9)
@@ -1399,4 +1398,3 @@ def generate_station_summary_csv(station_data, output_dir):
     print(f"\nCreated station summary CSV: {csv_file}")
 
     return csv_file
-

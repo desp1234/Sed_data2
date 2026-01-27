@@ -35,7 +35,9 @@ from tool import (
     build_ssc_q_envelope,
     check_ssc_q_consistency,
     plot_ssc_q_diagnostic,
-    propagate_ssc_q_inconsistency_to_ssl
+    propagate_ssc_q_inconsistency_to_ssl,
+    apply_quality_flag_array,        
+    apply_hydro_qc_with_provenance, 
 )
 PROJECT_ROOT = os.path.abspath(os.path.join(PARENT_DIR, '..'))
 
@@ -138,106 +140,70 @@ def assign_quality_flags(df):
 
 
 def apply_station_level_qc(station_df):
-    
-    """
-    Apply log-IQR and SSC–Q consistency QC using tool.py only.
-    """
+    # 1) 准备数组
+    Q   = station_df["Q"].to_numpy(dtype=float)
+    SSC = station_df["SSC"].to_numpy(dtype=float)
+    SSL = station_df["SSL"].to_numpy(dtype=float)
 
-    Q = station_df['Q'].values.astype(float)
-    SSC = station_df['SSC'].values.astype(float)
-    SSL = station_df['SSL'].values.astype(float)
+    # time：这里不纠结“days since 1970”，年序列也能跑 QC（只是用于返回/画图）
+    time = station_df["year"].to_numpy(dtype=float)
 
-    Q_flag = station_df['Q_flag'].values.astype(np.int8)
-    SSC_flag = station_df['SSC_flag'].values.astype(np.int8)
-    SSL_flag = station_df['SSL_flag'].values.astype(np.int8)
+    # 2) 显式调用 QC1-array（你要求的第二个函数）
+    Q_flag_qc1   = apply_quality_flag_array(Q,   "Q")
+    SSC_flag_qc1 = apply_quality_flag_array(SSC, "SSC")
+    SSL_flag_qc1 = apply_quality_flag_array(SSL, "SSL")
 
-    # ---------- log-IQR bounds ----------
-    ssc_low, ssc_high = compute_log_iqr_bounds(SSC)
-    ssl_low, ssl_high = compute_log_iqr_bounds(SSL)
+    # 用 QC1 的 missing(9) 来做 trim mask（和 tool 里 valid_time 逻辑一致）
+    valid_time = (Q_flag_qc1 != 9) | (SSC_flag_qc1 != 9) | (SSL_flag_qc1 != 9)
 
-    # ---------- SSC–Q envelope ----------
-    ssc_q_bounds = build_ssc_q_envelope(
-        Q_m3s=Q,
-        SSC_mgL=SSC,
-        k=1.5
+    if not valid_time.any():
+        return None 
+
+    # 3) SSL, SSC (derived), Q
+    qc = apply_hydro_qc_with_provenance(
+        time=time,
+        Q=Q,
+        SSC=SSC,
+        SSL=SSL,
+        Q_is_independent=True,
+        SSL_is_independent=True,
+        SSC_is_independent=False,
+        ssl_is_derived_from_q_ssc=False,
     )
 
-    # ---------- point-wise QC ----------
-    for i in range(len(station_df)):
+    if qc is None:
+        return None
 
-        # log-IQR (SSC)
-        if SSC_flag[i] == 0 and ssc_low and ssc_high:
-            if SSC[i] < ssc_low or SSC[i] > ssc_high:
-                SSC_flag[i] = 2
+    # 4) 对齐长度
+    station_df = station_df.loc[valid_time].copy()
 
-        # log-IQR (SSL)
-        if SSL_flag[i] == 0 and ssl_low and ssl_high:
-            if SSL[i] < ssl_low or SSL[i] > ssl_high:
-                SSL_flag[i] = 2
+    # 5) 写回最终 flags（
+    station_df["Q_flag"]   = qc["Q_flag"].astype("int8")
+    station_df["SSC_flag"] = qc["SSC_flag"].astype("int8")
+    station_df["SSL_flag"] = qc["SSL_flag"].astype("int8")
 
-        # SSC–Q consistency
-        is_inconsistent, _ = check_ssc_q_consistency(
-            Q=Q[i],
-            SSC=SSC[i],
-            Q_flag=Q_flag[i],
-            SSC_flag=SSC_flag[i],
-            ssc_q_bounds=ssc_q_bounds
-        )
+    Q_flag   = station_df["Q_flag"].to_numpy(np.int8)
+    SSC_flag = station_df["SSC_flag"].to_numpy(np.int8)
+    SSL_flag = station_df["SSL_flag"].to_numpy(np.int8)
 
-        if is_inconsistent:
-            # 1) SSC：一致性不通过 -> suspect
-            if SSC_flag[i] == 0:
-                SSC_flag[i] = np.int8(2)
-
-            # 2) SSL：根据规则选择性传播
-            SSL_flag[i] = propagate_ssc_q_inconsistency_to_ssl(
-                inconsistent=is_inconsistent,
-                Q=Q[i],
-                SSC=SSC[i],
-                SSL=SSL[i],
-                Q_flag=Q_flag[i],
-                SSC_flag=SSC_flag[i],
-                SSL_flag=SSL_flag[i],
-                ssl_is_derived_from_q_ssc=True,  #SSC 是由 Q 和 SSL 推出来的,所以这里设为 True。
-            )
-
-
-    station_df['Q_flag'] = Q_flag
-    station_df['SSC_flag'] = SSC_flag
-    station_df['SSL_flag'] = SSL_flag
-    # --- Simple QC summary (for printing) ---
-    n_valid_ssc = int(np.isfinite(SSC).sum())
-    n_valid_ssl = int(np.isfinite(SSL).sum())
-
-    log_iqr_skipped = (n_valid_ssc < 5) or (n_valid_ssl < 5)
-    ssc_q_check_skipped = (n_valid_ssc < 5)
-
-    # Flag counts
-    q0 = int((Q_flag == 0).sum())
-    q2 = int((Q_flag == 2).sum())
-    q3 = int((Q_flag == 3).sum())
-    q9 = int((Q_flag == 9).sum())
-
-    s0 = int((SSC_flag == 0).sum())
-    s2 = int((SSC_flag == 2).sum())
-    s3 = int((SSC_flag == 3).sum())
-    s9 = int((SSC_flag == 9).sum())
-
-    l0 = int((SSL_flag == 0).sum())
-    l2 = int((SSL_flag == 2).sum())
-    l3 = int((SSL_flag == 3).sum())
-    l9 = int((SSL_flag == 9).sum())
-
-    # Attach to df attrs so main() can read without changing return type
-    station_df.attrs["log_iqr_skipped"] = log_iqr_skipped
-    station_df.attrs["ssc_q_check_skipped"] = ssc_q_check_skipped
     station_df.attrs["flag_counts"] = {
-        "Q":   (q0, q2, q3, q9),
-        "SSC": (s0, s2, s3, s9),
-        "SSL": (l0, l2, l3, l9),
+        "Q":   (int((Q_flag==0).sum()),   int((Q_flag==2).sum()),   int((Q_flag==3).sum()),   int((Q_flag==9).sum())),
+        "SSC": (int((SSC_flag==0).sum()), int((SSC_flag==2).sum()), int((SSC_flag==3).sum()), int((SSC_flag==9).sum())),
+        "SSL": (int((SSL_flag==0).sum()), int((SSL_flag==2).sum()), int((SSL_flag==3).sum()), int((SSL_flag==9).sum())),
     }
 
+    station_df.attrs["log_iqr_skipped"] = (np.isfinite(station_df["SSC"]).sum() < 5) or (np.isfinite(station_df["SSL"]).sum() < 5)
+    station_df.attrs["ssc_q_check_skipped"] = (np.isfinite(station_df["SSC"]).sum() < 5)
+
+    # 确认两个函数都真的被调用
+    print(
+        f"[QC] QC1(good cnt): Q={(Q_flag_qc1==0).sum()}, SSC={(SSC_flag_qc1==0).sum()}, SSL={(SSL_flag_qc1==0).sum()} | "
+        f"Final(good cnt): Q={(station_df['Q_flag'].to_numpy()==0).sum()}, "
+        f"SSC={(station_df['SSC_flag'].to_numpy()==0).sum()}, SSL={(station_df['SSL_flag'].to_numpy()==0).sum()}"
+    )
+
     return station_df
+
 
 
 def create_netcdf_file(station_id, event_id, meta, data, output_dir):
