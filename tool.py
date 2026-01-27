@@ -1,18 +1,22 @@
 import pandas as pd
 import numpy as np
+import numpy.ma as ma
 import re
 import os
 import xarray as xr
-
+from netCDF4 import Dataset
 
 FILL_VALUE_FLOAT = np.float32(-9999.0)
 FILL_VALUE_INT = np.int8(9)
+NOT_CHECKED_INT = np.int8(8)
+ESTIMATED_INT = np.int8(1)  # derived/estimated data
+
 
 #=====================================
 # time unit conversion
 #====================================
 
-def parse_dms_to_decimal(dms_str): #这个函数用于把度分秒格式转换成十进制度格式
+def parse_dms_to_decimal(dms_str):
     """
     Convert degrees, minutes, seconds (DMS) to decimal degrees.
 
@@ -26,20 +30,20 @@ def parse_dms_to_decimal(dms_str): #这个函数用于把度分秒格式转换�
     float
         Decimal degrees
     """
-    if pd.isna(dms_str): 
+    if pd.isna(dms_str):
         return np.nan
 
     parts = re.findall(r'(\d+)', str(dms_str))
-    if len(parts) >= 2: #如果提取到的部分不少于2个
-        degrees = float(parts[0]) #提取度数部分
+    if len(parts) >= 2:
+        degrees = float(parts[0])
         minutes = float(parts[1])
         seconds = float(parts[2]) if len(parts) > 2 else 0.0
-        decimal = degrees + minutes/60.0 + seconds/3600.0 #转换成十进制度
+        decimal = degrees + minutes/60.0 + seconds/3600.0
         return decimal
     return np.nan
 
 
-def parse_period(period_str): #这个函数用于解析记录时期字符串
+def parse_period(period_str):
     """
     Parse period of record string.
 
@@ -70,7 +74,7 @@ def parse_period(period_str): #这个函数用于解析记录时期字符串
 # variable calculations
 #====================================
 
-def calculate_discharge(runoff_mm_yr, area_km2): #这个函数用于计算河流流量
+def calculate_discharge(runoff_mm_yr, area_km2):
     """
     Calculate river discharge from runoff and drainage area.
 
@@ -83,10 +87,10 @@ def calculate_discharge(runoff_mm_yr, area_km2): #这个函数用于计算河流
     """
     if pd.isna(runoff_mm_yr) or pd.isna(area_km2):
         return np.nan
-    return runoff_mm_yr * area_km2 / 31557.6 #转换成立方米每秒
+    return runoff_mm_yr * area_km2 / 31557.6
 
 
-def calculate_ssl_from_mt_yr(sediment_mt_yr): #这个函数用于把沉积物负荷从百万吨每年转换成吨每天
+def calculate_ssl_from_mt_yr(sediment_mt_yr):
     """
     Convert sediment load from Mt/yr to ton/day.
 
@@ -99,7 +103,7 @@ def calculate_ssl_from_mt_yr(sediment_mt_yr): #这个函数用于把沉积物负
         return np.nan
     return sediment_mt_yr * 1e6 / 365.25
 
-def convert_ssl_units_if_needed(ssl_da: xr.DataArray): #这个函数用于把沉积物负荷的单位从千克每秒转换成吨每天
+def convert_ssl_units_if_needed(ssl_da: xr.DataArray):
     """
     如果 sediment_flux 单位为 kg/s，则转换成 ton/day
     - kg/s × 86400 s/day / 1000 kg/ton = ton/day
@@ -122,7 +126,7 @@ def convert_ssl_units_if_needed(ssl_da: xr.DataArray): #这个函数用于把沉
         return da
 
 
-def calculate_ssc(ssl_ton_day, discharge_m3s): #这个函数用于计算悬浮沉积物浓度
+def calculate_ssc(ssl_ton_day, discharge_m3s):
     """
     Calculate suspended sediment concentration from sediment load and discharge.
 
@@ -140,7 +144,7 @@ def calculate_ssc(ssl_ton_day, discharge_m3s): #这个函数用于计算悬浮�
 # quality control
 #====================================
 
-def compute_log_iqr_bounds(values, k=1.5): #这个函数用于计算对数空间的四分位距边界 
+def compute_log_iqr_bounds(values, k=1.5):
     """
     Compute log-space IQR bounds for positive values.
 
@@ -156,6 +160,8 @@ def compute_log_iqr_bounds(values, k=1.5): #这个函数用于计算对数空间
     tuple
         (lower_bound, upper_bound) in original space
     """
+    if ma.isMaskedArray(values):
+        values = ma.filled(values, np.nan)
     values = np.asarray(values, dtype=float)
     values = values[np.isfinite(values) & (values > 0)]
 
@@ -173,7 +179,359 @@ def compute_log_iqr_bounds(values, k=1.5): #这个函数用于计算对数空间
 
     return lower, upper
 
-def apply_quality_flag(value, variable_name): #这个函数用于根据缺失值和物理不可能性应用质量标志
+def apply_log_iqr_screening(
+    values,
+    base_flag,
+    k=1.5,
+    min_samples=5,
+    suspect_flag=np.int8(2),
+    pass_flag=np.int8(0),
+    missing_flag=FILL_VALUE_INT,
+    not_checked_flag=NOT_CHECKED_INT,
+):
+    """
+    Apply log-IQR screening WITHOUT overriding upstream QC failures.
+
+    This helper is designed to be reusable across datasets/pipelines:
+    - It only evaluates points where base_flag == pass_flag (default 0),
+      so upstream flags like "bad=3" will never be overwritten as "suspect=2".
+    - It distinguishes missing vs not_checked at the step level:
+      - missing_flag (default 9): value is missing/fill/NaN
+      - not_checked_flag (default 8): not evaluated (e.g., <=0, failed upstream QC,
+        insufficient samples, or bounds not computed)
+
+    Parameters
+    ----------
+    values : array-like
+        Data values.
+    base_flag : array-like (int)
+        Upstream QC flag array (same length as values).
+    k : float
+        IQR multiplier in log space.
+    min_samples : int
+        Minimum number of evaluable samples required to compute bounds.
+
+    Returns
+    -------
+    step_flag : np.ndarray (int8)
+        Step-level provenance flag (pass/suspect/not_checked/missing).
+    updated_flag : np.ndarray (int8)
+        Updated final flag array (base_flag with suspect applied where appropriate).
+    bounds : tuple
+        (lower, upper) bounds in original space; (None, None) if not computed.
+    """
+    if ma.isMaskedArray(values):
+        values = ma.filled(values, np.nan)
+    v = np.asarray(values, dtype=float)
+    f = np.asarray(base_flag, dtype=np.int8)
+    n = len(v)
+
+    step_flag = np.full(n, not_checked_flag, dtype=np.int8)
+
+    # Missing detection: respect upstream missing flag and also guard against NaNs/fill.
+    missing_mask = (
+        (f == missing_flag)
+        | ~np.isfinite(v)
+        | np.isclose(v, FILL_VALUE_FLOAT, rtol=1e-5, atol=1e-5)
+    )
+    step_flag[missing_mask] = missing_flag
+
+    # Evaluate only where upstream says "good" and value is strictly positive
+    eval_mask = (f == pass_flag) & np.isfinite(v) & (v > 0)
+
+    if eval_mask.sum() < int(min_samples):
+        return step_flag, f.copy(), (None, None)
+
+    lower, upper = compute_log_iqr_bounds(v[eval_mask], k=k)
+    if lower is None:
+        return step_flag, f.copy(), (None, None)
+
+    step_flag[eval_mask] = pass_flag
+    outlier_mask = eval_mask & ((v < lower) | (v > upper))
+    step_flag[outlier_mask] = suspect_flag
+
+    updated_flag = f.copy()
+    # Key rule: only downgrade points that are currently "good"
+    updated_flag[outlier_mask] = suspect_flag
+
+    return step_flag, updated_flag, (lower, upper)
+
+def apply_qc2_log_iqr_if_independent(
+    values,
+    base_flag,
+    is_independent: bool,
+    *,
+    k=1.5,
+    min_samples=5,
+    pass_flag=np.int8(0),
+    suspect_flag=np.int8(2),
+    estimated_flag=ESTIMATED_INT,
+    bad_flag=np.int8(3),
+    missing_flag=FILL_VALUE_INT,
+    not_checked_flag=NOT_CHECKED_INT,
+    fill_value_float=FILL_VALUE_FLOAT,
+):
+    """
+    QC2: log-IQR screening applied ONLY to independent observations.
+
+    If is_independent == True:
+        - run apply_log_iqr_screening(values, base_flag)
+        - return (qc2_step_flag, updated_flag, bounds)
+
+    If is_independent == False (derived / estimated variable):
+        - QC2 is NOT applied:
+            qc2_step_flag:
+                - missing -> 9
+                - otherwise -> 8 (not_checked)
+        - final flag:
+            - downgrade ONLY "good(0)" points to "estimated(1)"
+            - keep suspect(2)/bad(3)/missing(9) unchanged
+        - bounds -> (None, None)
+
+    Notes
+    -----
+    - base_flag is the cumulative flag from upstream steps (typically QC1 or QC1+QCX).
+    - This function NEVER overwrites upstream bad/missing/suspect.
+    """
+
+    # normalize
+    if ma.isMaskedArray(values):
+        values = ma.filled(values, np.nan)
+    v = np.asarray(values, dtype=float)
+    f = np.asarray(base_flag, dtype=np.int8)
+    n = len(v)
+
+    # missing detection (same spirit as apply_log_iqr_screening)
+    missing_mask = (
+        (f == missing_flag)
+        | ~np.isfinite(v)
+        | np.isclose(v, float(fill_value_float), rtol=1e-5, atol=1e-5)
+    )
+
+    # -------------------------
+    # Case A: independent -> real QC2
+    # -------------------------
+    if bool(is_independent):
+        qc2_step_flag, updated_flag, bounds = apply_log_iqr_screening(
+            values=v,
+            base_flag=f,
+            k=k,
+            min_samples=min_samples,
+            suspect_flag=suspect_flag,
+            pass_flag=pass_flag,
+            missing_flag=missing_flag,
+            not_checked_flag=not_checked_flag,
+        )
+        return qc2_step_flag, updated_flag, bounds
+
+    # -------------------------
+    # Case B: derived -> no QC2, mark estimated
+    # -------------------------
+    qc2_step_flag = np.full(n, not_checked_flag, dtype=np.int8)
+    qc2_step_flag[missing_mask] = missing_flag
+
+    updated_flag = f.copy()
+
+    # Only turn "good(0)" into "estimated(1)" for non-missing points
+    mark_est_mask = (updated_flag == pass_flag) & (~missing_mask)
+
+    # Important: do NOT overwrite suspect(2)/bad(3)/missing(9)
+    updated_flag[mark_est_mask] = estimated_flag
+
+    return qc2_step_flag, updated_flag, (None, None)
+
+def apply_quality_flag_array(values, variable_name=""):
+    """
+    Vectorized wrapper for apply_quality_flag (returns int8 flag array).
+
+    This exists so dataset scripts can reuse the exact same QC1 logic without
+    re-implementing list comprehensions.
+    """
+    if ma.isMaskedArray(values):
+        values = ma.filled(values, np.nan)
+    arr = np.asarray(values)
+    return np.array([apply_quality_flag(v, variable_name) for v in arr], dtype=np.int8)
+
+def apply_hydro_qc_with_provenance(
+    time,
+    Q,
+    SSC,
+    SSL,
+    *,
+    Q_is_independent: bool = True,
+    SSC_is_independent: bool = True,
+    SSL_is_independent: bool = False,
+    ssl_is_derived_from_q_ssc: bool = True,
+    qc2_k: float = 1.5,
+    qc2_min_samples: int = 5,
+    qc3_k: float = 1.5,
+    qc3_min_samples: int = 5,
+):
+    """
+    End-to-end QC pipeline (QC1/QC2/QC3) with step-level provenance flags.
+
+    Designed for reuse across datasets that provide:
+    - Q   : discharge (independent or not)
+    - SSC : suspended sediment concentration (independent or not)
+    - SSL : suspended sediment load (often derived from Q×SSC)
+
+    Flag conventions
+    ----------------
+    Final flags (Q_flag/SSC_flag/SSL_flag):
+    - 0 good, 1 estimated (typically derived), 2 suspect, 3 bad, 9 missing
+
+    Step flags:
+    - QC1 physical: 0 pass, 3 bad, 9 missing
+    - QC2 log-IQR: 0 pass, 2 suspect, 8 not_checked, 9 missing
+    - QC3 SSC–Q:  0 pass, 2 suspect, 8 not_checked, 9 missing
+    - QC3 SSL propagation: 2 propagated, 0 not_propagated, 8 not_checked, 9 missing
+
+    Returns
+    -------
+    dict or None
+        Dict contains trimmed arrays (valid_time) and all flags.
+        Returns None if no valid time remains.
+    """
+    time = np.asarray(time)
+    n = len(time)
+
+    # Normalize values for numeric operations (preserve NaNs)
+    def _to_float_array(x):
+        if ma.isMaskedArray(x):
+            x = ma.filled(x, np.nan)
+        return np.asarray(x, dtype=float)
+
+    Qv = _to_float_array(Q)
+    SSCv = _to_float_array(SSC)
+    SSLv = _to_float_array(SSL)
+
+    # -----------------------------
+    # QC1. Physical feasibility / missing
+    # -----------------------------
+    Q_flag_qc1_physical = apply_quality_flag_array(Qv, "Q")
+    SSC_flag_qc1_physical = apply_quality_flag_array(SSCv, "SSC")
+    SSL_flag_qc1_physical = apply_quality_flag_array(SSLv, "SSL")
+
+    Q_flag = Q_flag_qc1_physical.copy()
+    SSC_flag = SSC_flag_qc1_physical.copy()
+    SSL_flag = SSL_flag_qc1_physical.copy()
+
+    # -----------------------------
+    # QC2. log-IQR screening (only for independent observations)
+    # -----------------------------
+    Q_flag_qc2_log_iqr, Q_flag, _ = apply_qc2_log_iqr_if_independent(
+        values=Qv,
+        base_flag=Q_flag,
+        is_independent=Q_is_independent,
+        k=qc2_k,
+        min_samples=qc2_min_samples,
+    )
+    SSC_flag_qc2_log_iqr, SSC_flag, _ = apply_qc2_log_iqr_if_independent(
+        values=SSCv,
+        base_flag=SSC_flag,
+        is_independent=SSC_is_independent,
+        k=qc2_k,
+        min_samples=qc2_min_samples,
+    )
+    SSL_flag_qc2_log_iqr, SSL_flag, _ = apply_qc2_log_iqr_if_independent(
+        values=SSLv,
+        base_flag=SSL_flag,
+        is_independent=SSL_is_independent,
+        k=qc2_k,
+        min_samples=qc2_min_samples,
+    )
+
+    # -----------------------------
+    # QC3. SSC–Q consistency + propagate to SSL if derived
+    # -----------------------------
+    SSC_flag_qc3_ssc_q = np.full(n, NOT_CHECKED_INT, dtype=np.int8)
+    SSL_flag_qc3_from_ssc_q = np.full(n, NOT_CHECKED_INT, dtype=np.int8)
+
+    # Mark missing explicitly (distinguish from not_checked)
+    SSC_flag_qc3_ssc_q[SSC_flag_qc1_physical == FILL_VALUE_INT] = FILL_VALUE_INT
+    SSL_flag_qc3_from_ssc_q[SSL_flag_qc1_physical == FILL_VALUE_INT] = FILL_VALUE_INT
+
+    env_mask = (
+        (Q_flag == 0)
+        & (SSC_flag == 0)
+        & np.isfinite(Qv)
+        & np.isfinite(SSCv)
+        & (Qv > 0)
+        & (SSCv > 0)
+    )
+
+    Q_env = np.where(env_mask, Qv, np.nan)
+    SSC_env = np.where(env_mask, SSCv, np.nan)
+    ssc_q_bounds = build_ssc_q_envelope(Q_env, SSC_env, k=qc3_k, min_samples=qc3_min_samples)
+
+    if ssc_q_bounds is not None:
+        SSC_flag_qc3_ssc_q[env_mask] = np.int8(0)
+
+        for i in np.where(env_mask)[0]:
+            inconsistent, _ = check_ssc_q_consistency(
+                Qv[i],
+                SSCv[i],
+                Q_flag[i],
+                SSC_flag[i],
+                ssc_q_bounds,
+            )
+
+            if not inconsistent:
+                continue
+
+            # SSC downgrade
+            SSC_flag_qc3_ssc_q[i] = np.int8(2)
+            SSC_flag[i] = np.int8(2)
+
+            # Propagate to SSL (optional)
+            prev_ssl_flag = SSL_flag[i]
+            SSL_flag[i] = propagate_ssc_q_inconsistency_to_ssl(
+                inconsistent=True,
+                Q=Qv[i],
+                SSC=SSCv[i],
+                SSL=SSLv[i],
+                Q_flag=Q_flag[i],
+                SSC_flag=np.int8(0),  # use pre-downgrade SSC state for propagation logic
+                SSL_flag=prev_ssl_flag,
+                ssl_is_derived_from_q_ssc=ssl_is_derived_from_q_ssc,
+            )
+
+            # Record whether propagation actually downgraded SSL to suspect
+            SSL_flag_qc3_from_ssc_q[i] = (
+                np.int8(2)
+                if (prev_ssl_flag in (np.int8(0), ESTIMATED_INT) and SSL_flag[i] == np.int8(2))
+                else np.int8(0)
+            )
+
+    # -----------------------------
+    # Valid-time mask: keep days where ANY variable is non-missing
+    # -----------------------------
+    valid_time = (Q_flag != FILL_VALUE_INT) | (SSC_flag != FILL_VALUE_INT) | (SSL_flag != FILL_VALUE_INT)
+    if not np.any(valid_time):
+        return None
+
+    return {
+        "time": time[valid_time],
+        "Q": Qv[valid_time],
+        "SSC": SSCv[valid_time],
+        "SSL": SSLv[valid_time],
+        "Q_flag": Q_flag[valid_time],
+        "SSC_flag": SSC_flag[valid_time],
+        "SSL_flag": SSL_flag[valid_time],
+        # Step-level provenance flags
+        "Q_flag_qc1_physical": Q_flag_qc1_physical[valid_time],
+        "SSC_flag_qc1_physical": SSC_flag_qc1_physical[valid_time],
+        "SSL_flag_qc1_physical": SSL_flag_qc1_physical[valid_time],
+        "Q_flag_qc2_log_iqr": Q_flag_qc2_log_iqr[valid_time],
+        "SSC_flag_qc2_log_iqr": SSC_flag_qc2_log_iqr[valid_time],
+        "SSL_flag_qc2_log_iqr": SSL_flag_qc2_log_iqr[valid_time],
+        "SSC_flag_qc3_ssc_q": SSC_flag_qc3_ssc_q[valid_time],
+        "SSL_flag_qc3_from_ssc_q": SSL_flag_qc3_from_ssc_q[valid_time],
+        # Extra (useful for plotting/debug)
+        "ssc_q_bounds": ssc_q_bounds,
+    }
+
+def apply_quality_flag(value, variable_name):
     """
     Apply quality flag based only on missing values and physical impossibility.
 
@@ -188,26 +546,35 @@ def apply_quality_flag(value, variable_name): #这个函数用于根据缺失值
     - Statistical outlier detection, if any, is handled separately.
     """
 
-    # Missing
-    if pd.isna(value) or np.isnan(value):
-        return np.int8(9) #如果值是缺失的，返回9
-    # Check for fill value (-9999) before checking for negative values
-    # Use np.isclose to handle floating point precision issues
+    # Robust missing/invalid handling:
+    # - netCDF often yields masked values (np.ma.masked / MaskedConstant)
+    # - some datasets may contain non-numeric objects
+    if value is None or ma.is_masked(value):
+        return np.int8(9)
+
+    # Convert to float safely; non-convertible values are treated as missing
+    try:
+        v = float(value)
+    except Exception:
+        return np.int8(9)
+
+    # Missing / fill / non-finite
+    if not np.isfinite(v):
+        return np.int8(9)
+    if np.isclose(v, float(FILL_VALUE_FLOAT), rtol=1e-5, atol=1e-5):
+        return np.int8(9)
+
     # Physical impossibility
-    if np.isclose(value, FILL_VALUE_FLOAT, rtol=1e-5, atol=1e-5):
-        return np.int8(9) #如果值是填充值，返回9
+    if v < 0:
+        return np.int8(3)
 
-    if value < 0:
-        return np.int8(3) #如果值是负数，返回3
-
-    # Otherwise good
     return np.int8(0)
 
-def build_ssc_q_envelope( #这个函数用于构建悬浮沉积物浓度与流量之间的一致性包络线
+def build_ssc_q_envelope(
     Q_m3s,
     SSC_mgL,
-    k=1.5, #1.5是四分位距的倍数
-    min_samples=5 #最小样本数
+    k=1.5,
+    min_samples=5
 ):
     """
     Build a dataset-level SSC–Q consistency envelope in log–log space
@@ -266,9 +633,7 @@ def build_ssc_q_envelope( #这个函数用于构建悬浮沉积物浓度与流�
         "upper": q3 + k * iqr,
     }
 
-
-
-def check_ssc_q_consistency( #这个函数用于检查悬浮沉积物浓度与流量之间的一致性
+def check_ssc_q_consistency(
     Q,
     SSC,
     Q_flag,
@@ -330,8 +695,7 @@ def check_ssc_q_consistency( #这个函数用于检查悬浮沉积物浓度与�
 
     return is_inconsistent, resid
 
-
-def propagate_ssc_q_inconsistency_to_ssl( #这个函数用于将悬浮沉积物浓度与流量之间的不一致性传播到沉积物负荷
+def propagate_ssc_q_inconsistency_to_ssl(
     inconsistent,
     Q,
     SSC,
@@ -404,10 +768,321 @@ def propagate_ssc_q_inconsistency_to_ssl( #这个函数用于将悬浮沉积物�
     # --------------------------------------------------
     # Propagation: downgrade SSL from good → suspect
     # --------------------------------------------------
-    if SSL_flag == 0:
+    if SSL_flag in (np.int8(0), ESTIMATED_INT):
         return np.int8(2)
 
     return SSL_flag
+
+def check_nc_completeness(
+    nc_path,
+    required_vars=None,
+    required_attrs=None,
+    strict=False,
+):
+    """
+    Check whether a NetCDF dataset contains the expected variables and global attributes.
+
+    Parameters
+    ----------
+    nc_path : str
+        Path to the NetCDF file to validate.
+    required_vars : list[str] or None
+        Explicit list of variables that must exist. Defaults to standard variables
+        used across dataset processors.
+    required_attrs : list[str] or None
+        Explicit list of global attributes that must exist. Defaults to common
+        CF/ACDD metadata fields used in dataset processors.
+    strict : bool
+        If True, missing extended attributes are treated as errors. If False,
+        they are reported as warnings.
+
+    Returns
+    -------
+    tuple[list[str], list[str]]
+        (errors, warnings)
+    """
+    default_var_requirements = {
+        "time": ["units", "calendar"],
+        "lat": ["units"],
+        "lon": ["units"],
+        "Q": ["units", "long_name", "ancillary_variables"],
+        "Q_flag": ["flag_values", "flag_meanings"],
+        "SSC": ["units", "long_name", "ancillary_variables"],
+        "SSC_flag": ["flag_values", "flag_meanings"],
+        "SSL": ["units", "long_name", "ancillary_variables"],
+        "SSL_flag": ["flag_values", "flag_meanings"],
+    }
+
+    default_required_attrs = [
+        "Conventions",
+        "title",
+        "summary",
+        "source",
+        "data_source_name",
+        "variables_provided",
+        "number_of_data",
+        "reference",
+        "source_data_link",
+        "creator_name",
+        "creator_email",
+        "creator_institution",
+        "processing_level",
+        "comment",
+    ]
+
+    strict_attrs = [
+        "temporal_resolution",
+        "time_coverage_start",
+        "time_coverage_end",
+        "geographic_coverage",
+        "geospatial_lat_min",
+        "geospatial_lat_max",
+        "geospatial_lon_min",
+        "geospatial_lon_max",
+    ]
+
+    errors = []
+    warnings = []
+
+    required_vars = required_vars or list(default_var_requirements.keys())
+    required_attrs = required_attrs or default_required_attrs
+
+    with Dataset(nc_path, mode="r") as ds:
+        available_attrs = set(ds.ncattrs())
+
+        for attr in required_attrs:
+            if attr not in available_attrs:
+                errors.append(f"Missing global attribute: {attr}")
+
+        for attr in strict_attrs:
+            if attr not in available_attrs:
+                message = f"Missing global attribute: {attr}"
+                if strict:
+                    errors.append(message)
+                else:
+                    warnings.append(message)
+
+        for var_name in required_vars:
+            if var_name not in ds.variables:
+                errors.append(f"Missing variable: {var_name}")
+                continue
+
+            attrs_required = default_var_requirements.get(var_name, [])
+            var_attrs = set(ds.variables[var_name].ncattrs())
+            for attr in attrs_required:
+                if attr not in var_attrs:
+                    errors.append(
+                        f"Variable '{var_name}' missing attribute: {attr}"
+                    )
+
+        if "variables_provided" in available_attrs:
+            provided = [
+                item.strip()
+                for item in str(ds.getncattr("variables_provided")).split(",")
+                if item.strip()
+            ]
+            for var_name in provided:
+                if var_name not in ds.variables:
+                    errors.append(
+                        "variables_provided lists missing variable: "
+                        f"{var_name}"
+                    )
+
+    return errors, warnings
+
+def check_variable_metadata_tiered(
+    nc_path,
+    *,
+    tier: str = "basic",
+    extra_requirements: dict | None = None,
+    treat_empty_as_missing: bool = True,
+    strict_empty: bool = False,
+):
+    """
+    Tiered variable metadata completeness checker.
+
+    Tiers
+    -----
+    basic:
+        - Minimal, low false-positive checks.
+        - Focus on: time/lat/lon units + time calendar
+                  Q/SSC/SSL units + long_name + ancillary_variables
+                  flag vars flag_values + flag_meanings
+    recommended:
+        - Adds common CF/ACDD-friendly attributes that improve interoperability.
+        - Focus on: coordinates, standard_name presence (not validation),
+                    axis for coordinate vars, fill_value presence for flags
+    strict:
+        - Stronger expectations; still no external CF standard_name table.
+        - Adds: valid_range (lat/lon), positive for altitude if present,
+                comment presence for data vars, standard_name presence for data vars
+                (as a requirement; can be strict in some pipelines)
+
+    Parameters
+    ----------
+    nc_path : str or Path
+        NetCDF file to check.
+    tier : {"basic","recommended","strict"}
+    extra_requirements : dict or None
+        Additional/override requirements, merged into tier rules.
+        Format: {var_name: {"require": [...], "warn": [...]} }
+        - "require" missing -> errors
+        - "warn" missing -> warnings
+    treat_empty_as_missing : bool
+        Whether empty strings / None-like values are treated as missing.
+    strict_empty : bool
+        If True, empty values are treated as errors (when the key exists).
+        If False, empty values become warnings (unless tier/attr is required and you want to enforce).
+
+    Returns
+    -------
+    errors : list[str]
+    warnings : list[str]
+    """
+    tier = str(tier).lower().strip()
+    if tier not in {"basic", "recommended", "strict"}:
+        raise ValueError("tier must be one of: 'basic', 'recommended', 'strict'")
+
+    # -----------------------------
+    # Tier rule definitions
+    # -----------------------------
+    # Each var has:
+    #   - require: missing -> error
+    #   - warn:    missing -> warning
+    # Note: "existence" of a variable is checked if it appears in any rule.
+    BASIC = {
+        "time": {"require": ["units", "calendar"], "warn": ["long_name"]},
+        "lat": {"require": ["units"], "warn": ["standard_name", "long_name"]},
+        "lon": {"require": ["units"], "warn": ["standard_name", "long_name"]},
+        "Q": {"require": ["units", "long_name", "ancillary_variables"], "warn": ["standard_name", "coordinates", "comment"]},
+        "Q_flag": {"require": ["flag_values", "flag_meanings"], "warn": ["long_name", "standard_name"]},
+        "SSC": {"require": ["units", "long_name", "ancillary_variables"], "warn": ["standard_name", "coordinates", "comment"]},
+        "SSC_flag": {"require": ["flag_values", "flag_meanings"], "warn": ["long_name", "standard_name"]},
+        "SSL": {"require": ["units", "long_name", "ancillary_variables"], "warn": ["standard_name", "coordinates", "comment"]},
+        "SSL_flag": {"require": ["flag_values", "flag_meanings"], "warn": ["long_name", "standard_name"]},
+    }
+
+    RECOMMENDED = {
+        # coordinates & axis are very common; still keep as warnings unless strict.
+        "time": {"require": ["units", "calendar"], "warn": ["axis", "standard_name", "long_name"]},
+        "lat": {"require": ["units"], "warn": ["standard_name", "axis", "valid_range", "long_name"]},
+        "lon": {"require": ["units"], "warn": ["standard_name", "axis", "valid_range", "long_name"]},
+        "Q": {"require": ["units", "long_name", "ancillary_variables"], "warn": ["standard_name", "coordinates", "comment"]},
+        "Q_flag": {"require": ["flag_values", "flag_meanings"], "warn": ["long_name", "standard_name", "_FillValue"]},
+        "SSC": {"require": ["units", "long_name", "ancillary_variables"], "warn": ["standard_name", "coordinates", "comment"]},
+        "SSC_flag": {"require": ["flag_values", "flag_meanings"], "warn": ["long_name", "standard_name", "_FillValue"]},
+        "SSL": {"require": ["units", "long_name", "ancillary_variables"], "warn": ["standard_name", "coordinates", "comment"]},
+        "SSL_flag": {"require": ["flag_values", "flag_meanings"], "warn": ["long_name", "standard_name", "_FillValue"]},
+        # optional station scalar vars if present (warn only)
+        "altitude": {"require": [], "warn": ["units", "positive", "long_name", "standard_name"]},
+        "upstream_area": {"require": [], "warn": ["units", "long_name"]},
+    }
+
+    STRICT = {
+        # Make more things "require"
+        "time": {"require": ["units", "calendar"], "warn": ["axis", "standard_name", "long_name"]},
+        "lat": {"require": ["units", "standard_name"], "warn": ["axis", "valid_range", "long_name"]},
+        "lon": {"require": ["units", "standard_name"], "warn": ["axis", "valid_range", "long_name"]},
+        "Q": {"require": ["units", "long_name", "ancillary_variables", "coordinates"], "warn": ["standard_name", "comment"]},
+        "Q_flag": {"require": ["flag_values", "flag_meanings"], "warn": ["long_name", "standard_name", "_FillValue"]},
+        "SSC": {"require": ["units", "long_name", "ancillary_variables", "coordinates"], "warn": ["standard_name", "comment"]},
+        "SSC_flag": {"require": ["flag_values", "flag_meanings"], "warn": ["long_name", "standard_name", "_FillValue"]},
+        "SSL": {"require": ["units", "long_name", "ancillary_variables", "coordinates"], "warn": ["standard_name", "comment"]},
+        "SSL_flag": {"require": ["flag_values", "flag_meanings"], "warn": ["long_name", "standard_name", "_FillValue"]},
+        # If altitude exists, enforce core attrs
+        "altitude": {"require": [], "warn": []},  # handled dynamically below
+        "upstream_area": {"require": [], "warn": ["units", "long_name"]},
+    }
+
+    rules = BASIC if tier == "basic" else RECOMMENDED if tier == "recommended" else STRICT
+
+    # Merge extra_requirements (override/extend)
+    if extra_requirements:
+        for vname, spec in extra_requirements.items():
+            if vname not in rules:
+                rules[vname] = {"require": [], "warn": []}
+            for k in ("require", "warn"):
+                if k in spec and spec[k]:
+                    # merge unique
+                    merged = list(dict.fromkeys(list(rules[vname].get(k, [])) + list(spec[k])))
+                    rules[vname][k] = merged
+
+    errors = []
+    warnings = []
+
+    def _is_empty(val) -> bool:
+        if val is None:
+            return True
+        if isinstance(val, str) and val.strip() == "":
+            return True
+        return False
+
+    with Dataset(str(nc_path), mode="r") as ds:
+        # Dynamic strict rules for altitude if present
+        if tier == "strict" and "altitude" in ds.variables:
+            STRICT["altitude"] = {"require": ["units", "long_name"], "warn": ["positive", "standard_name", "comment"]}
+
+        # ---------- existence check ----------
+        for vname in rules.keys():
+            # Only require existence for core vars; for optional vars we can allow missing:
+            # Heuristic: if a var has any "require" attrs, treat var itself as required.
+            var_is_required = len(rules[vname].get("require", [])) > 0
+            if vname not in ds.variables:
+                if var_is_required:
+                    errors.append(f"Missing required variable: {vname}")
+                else:
+                    # optional variable absent -> ok
+                    continue
+
+        # ---------- attribute check ----------
+        for vname, spec in rules.items():
+            if vname not in ds.variables:
+                continue
+
+            var = ds.variables[vname]
+            present_attrs = set(var.ncattrs())
+
+            for attr in spec.get("require", []):
+                if attr not in present_attrs:
+                    errors.append(f"Variable '{vname}' missing required attribute: {attr}")
+                    continue
+
+                if treat_empty_as_missing:
+                    try:
+                        val = getattr(var, attr)
+                    except Exception:
+                        val = None
+                    if _is_empty(val):
+                        msg = f"Variable '{vname}' required attribute '{attr}' is empty/None"
+                        if strict_empty:
+                            errors.append(msg)
+                        else:
+                            warnings.append(msg)
+
+            for attr in spec.get("warn", []):
+                if attr not in present_attrs:
+                    warnings.append(f"Variable '{vname}' missing recommended attribute: {attr}")
+                    continue
+
+                if treat_empty_as_missing:
+                    try:
+                        val = getattr(var, attr)
+                    except Exception:
+                        val = None
+                    if _is_empty(val):
+                        warnings.append(f"Variable '{vname}' recommended attribute '{attr}' is empty/None")
+
+        # ---------- light sanity checks (non-fatal) ----------
+        # Units should exist and be non-empty for common vars
+        for vname in ("Q", "SSC", "SSL", "lat", "lon", "time"):
+            if vname in ds.variables and "units" in ds.variables[vname].ncattrs():
+                u = str(getattr(ds.variables[vname], "units", "")).strip()
+                if u == "":
+                    warnings.append(f"Variable '{vname}' has empty 'units' attribute")
+
+    return errors, warnings
+
+
 
 #=====================================
 # plot_session
@@ -415,7 +1090,7 @@ def propagate_ssc_q_inconsistency_to_ssl( #这个函数用于将悬浮沉积物�
 
 import matplotlib.pyplot as plt
 
-def plot_ssc_q_diagnostic( #这个函数用于绘制悬浮沉积物浓度与流量之间的诊断图
+def plot_ssc_q_diagnostic(
     time,
     Q,
     SSC,
@@ -424,7 +1099,7 @@ def plot_ssc_q_diagnostic( #这个函数用于绘制悬浮沉积物浓度与流�
     ssc_q_bounds,
     station_id,
     station_name,
-    out_png, #这些是需要传入的参数
+    out_png,
 ):
     """
     Create and save a station-level SSC–Q diagnostic plot.
@@ -536,11 +1211,12 @@ def plot_ssc_q_diagnostic( #这个函数用于绘制悬浮沉积物浓度与流�
     fig.savefig(out_png, dpi=300)
     plt.close(fig)
 
+
 #=====================================
 # summary CSV generation
 #====================================
 
-def generate_station_summary_csv(station_data, output_dir): # 用于生成站点元数据和数据完整性的CSV汇总文件
+def generate_station_summary_csv(station_data, output_dir):
     """Generate a CSV summary file of station metadata and data completeness."""
 
     csv_file = os.path.join(output_dir, 'ALi_De_Boer_station_summary.csv')
@@ -569,7 +1245,7 @@ def generate_station_summary_csv(station_data, output_dir): # 用于生成站点
             vars_provided.append('SSL')
         vars_str = ', '.join(vars_provided) if vars_provided else "N/A"
 
-        summary_data.append({ #添加站点的汇总信息到列表
+        summary_data.append({
             'station_name': data['station_name'],
             'Source_ID': data['source_id'],
             'river_name': data['river_name'],
@@ -602,4 +1278,3 @@ def generate_station_summary_csv(station_data, output_dir): # 用于生成站点
     print(f"\nCreated station summary CSV: {csv_file}")
 
     return csv_file
-
