@@ -224,21 +224,36 @@ def process_station(input_file, output_dir):
             qc3_k=1.5, 
             qc3_min_samples=5,
         )
+
         print("[DBG] qc is None?", qc is None)   # <- 加在 if qc is None 之前
         if qc is None:
             return None
-
 
         # 把最终结果写回 flags 数组（后面统计/写文件都靠它）
         q_flags   = qc["Q_flag"]
         ssc_flags = qc["SSC_flag"]
         ssl_flags = qc["SSL_flag"]
+        # -----------------------------
+        # Step-level provenance flags (if present in qc dict)
+        # -----------------------------
+        Q_qc1  = qc.get("Q_flag_qc1_physical")
+        SSC_qc1 = qc.get("SSC_flag_qc1_physical")
+        SSL_qc1 = qc.get("SSL_flag_qc1_physical")
+
+        Q_qc2  = qc.get("Q_flag_qc2_log_iqr")
+        SSC_qc2 = qc.get("SSC_flag_qc2_log_iqr")
+        SSL_qc2 = qc.get("SSL_flag_qc2_log_iqr")
+
+        # QC3: SSC–Q consistency step & SSL propagation step（key 名以 tool.py 实际为准）
+        SSC_qc3 = qc.get("SSC_flag_qc3_ssc_q_consistency") or qc.get("SSC_flag_qc3_ssc_q")
+        SSL_qc3 = qc.get("SSL_flag_qc3_propagation") or qc.get("SSL_flag_qc3_ssl_propagation")
 
         print(
             f"[QC] {station_id} QC1(good cnt): "
             f"Q={(Q_flag_qc1==0).sum()}, SSC={(SSC_flag_qc1==0).sum()}, SSL={(SSL_flag_qc1==0).sum()} | "
             f"Final(good cnt): Q={(q_flags==0).sum()}, SSC={(ssc_flags==0).sum()}, SSL={(ssl_flags==0).sum()}"
         )
+
         # ------------------------------------------------------------
         # Build station-level warnings for summary tools
         # ------------------------------------------------------------
@@ -478,6 +493,26 @@ def process_station(input_file, output_dir):
             ssl_flag_var.flag_meanings = 'good_data estimated_data suspect_data bad_data missing_data'
             ssl_flag_var.comment = 'Quality flags: 0=good (SSL≥0), 1=estimated, 2=suspect, 3=bad (SSL<0), 9=missing'
             ssl_flag_var[:] = ssl_flags
+            # ------------------------------------------------------------
+            # Step-level provenance flags (optional)
+            # ------------------------------------------------------------
+            def _write_step_flag(name, arr):
+                if arr is None:
+                    return
+                v = ds.createVariable(name, 'i1', ('time',), zlib=True, complevel=4)
+                v.long_name = f"step-level provenance flag: {name}"
+                v[:] = np.asarray(arr, dtype=np.int8)
+
+            _write_step_flag("Q_flag_qc1_physical", Q_qc1)
+            _write_step_flag("Q_flag_qc2_log_iqr",  Q_qc2)
+
+            _write_step_flag("SSC_flag_qc1_physical", SSC_qc1)
+            _write_step_flag("SSC_flag_qc2_log_iqr",  SSC_qc2)
+            _write_step_flag("SSC_flag_qc3_ssc_q_consistency", SSC_qc3)
+
+            _write_step_flag("SSL_flag_qc1_physical", SSL_qc1)
+            _write_step_flag("SSL_flag_qc2_log_iqr",  SSL_qc2)
+            _write_step_flag("SSL_flag_qc3_propagation", SSL_qc3)
 
             # Global attributes (CF-1.8 and ACDD-1.3 compliant)
             ds.Conventions = 'CF-1.8, ACDD-1.3'
@@ -573,10 +608,77 @@ def process_station(input_file, output_dir):
             "SSL_final_bad": int(ssl_bad),
             "SSL_final_missing": int(ssl_missing),
         }
+        # ===== b 部分：把“范例式字段”补齐（final_* + estimated）=====
+        q_estimated   = int((q_flags == 1).sum())
+        ssc_estimated = int((ssc_flags == 1).sum())
+        ssl_estimated = int((ssl_flags == 1).sum())
+        def _count_step_flags(arr, mapping):
+            if arr is None:
+                return None
+            arr = np.asarray(arr)
+            return {k: int((arr == v).sum()) for k, v in mapping.items()}
 
+        qc1_map = {"pass": 0, "bad": 3, "missing": 9}
+        qc2_map = {"pass": 0, "suspect": 2, "not_checked": 8, "missing": 9}
+        qc3_map = {"pass": 0, "suspect": 2, "not_checked": 8, "missing": 9}
+        qc3_ssl_map = {"not_propagated": 0, "propagated": 2, "not_checked": 8, "missing": 9}
+
+        for var, arr, mp, prefix in [
+            ("Q",   Q_qc1,   qc1_map,     "qc1"),
+            ("SSC", SSC_qc1, qc1_map,     "qc1"),
+            ("SSL", SSL_qc1, qc1_map,     "qc1"),
+
+            ("Q",   Q_qc2,   qc2_map,     "qc2"),
+            ("SSC", SSC_qc2, qc2_map,     "qc2"),
+            ("SSL", SSL_qc2, qc2_map,     "qc2"),
+
+            ("SSC", SSC_qc3, qc3_map,     "qc3"),
+            ("SSL", SSL_qc3, qc3_ssl_map, "qc3"),
+        ]:
+            c = _count_step_flags(arr, mp)
+            if c is not None:
+                station_info.update({f"{var}_{prefix}_{k}": v for k, v in c.items()})
+
+        # -----------------------------
+        # Step-level flag counts -> station_info (HYDAT-style)
+        # -----------------------------
+        def _count_step_flags(arr, mapping):
+            if arr is None:
+                return None
+            arr = np.asarray(arr, dtype=np.int8)
+            return {k: int((arr == v).sum()) for k, v in mapping.items()}
+
+        # QC1: 0 pass, 3 bad, 9 missing
+        qc1_map = {"pass": 0, "bad": 3, "missing": 9}
+
+        # QC2: 0 pass, 2 suspect, 8 not_checked, 9 missing
+        qc2_map = {"pass": 0, "suspect": 2, "not_checked": 8, "missing": 9}
+
+        # QC3 SSC–Q: 0 pass, 2 suspect, 8 not_checked, 9 missing
+        qc3_map = {"pass": 0, "suspect": 2, "not_checked": 8, "missing": 9}
+
+        # QC3 SSL propagation: 0 not_propagated, 2 propagated, 8 not_checked, 9 missing
+        qc3_ssl_map = {"not_propagated": 0, "propagated": 2, "not_checked": 8, "missing": 9}
+
+        # 逐个变量逐步写入（有就写，没有就跳过）
+        for var, arr, mp, prefix in [
+            ("Q",   Q_qc1,   qc1_map,     "qc1"),
+            ("SSC", SSC_qc1, qc1_map,     "qc1"),
+            ("SSL", SSL_qc1, qc1_map,     "qc1"),
+
+            ("Q",   Q_qc2,   qc2_map,     "qc2"),
+            ("SSC", SSC_qc2, qc2_map,     "qc2"),
+            ("SSL", SSL_qc2, qc2_map,     "qc2"),
+
+            ("SSC", SSC_qc3, qc3_map,     "qc3"),
+            ("SSL", SSL_qc3, qc3_ssl_map, "qc3"),
+        ]:
+            c = _count_step_flags(arr, mp)
+            if c is not None:
+                station_info.update({f"{var}_{prefix}_{k}": v for k, v in c.items()})
 
         return station_info
-
+    
     except Exception as e:
         print(f"  ERROR processing {os.path.basename(input_file)}: {e}")
         import traceback
