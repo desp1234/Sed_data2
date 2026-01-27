@@ -34,9 +34,10 @@ from tool import (
     check_ssc_q_consistency,
     plot_ssc_q_diagnostic,
     convert_ssl_units_if_needed,
-    propagate_ssc_q_inconsistency_to_ssl
+    propagate_ssc_q_inconsistency_to_ssl,
+    apply_quality_flag_array,        
+    apply_hydro_qc_with_provenance, 
 )
-
 
 # =========================
 # 全局 QC / FLAG 设置
@@ -371,76 +372,64 @@ def process_single_netcdf(nc_path: str, output_dir: str) -> dict | None:
     ssl_arr = df["SSL"].values.astype(float)
 
     # --------------------------------------------------
-    # Build station-level SSC–Q envelope (standard units)
+    # Build station-level SSC–Q envelope (for diagnostic plot)
     # --------------------------------------------------
-    ssc_q_bounds = build_ssc_q_envelope(
-        Q_m3s=q_arr,
-        SSC_mgL=ssc_arr,
-        k=1.5
+    ssc_q_bounds = build_ssc_q_envelope(Q_m3s=q_arr, SSC_mgL=ssc_arr, k=1.5)
+    # 1) QC1-array
+    Q_flag_qc1   = apply_quality_flag_array(q_arr,  "Q")
+    SSC_flag_qc1 = apply_quality_flag_array(ssc_arr,"SSC")
+    SSL_flag_qc1 = apply_quality_flag_array(ssl_arr,"SSL")
+
+    # 2) QC1 的 missing(9) 做一次 trim
+    valid_time = (Q_flag_qc1 != 9) | (SSC_flag_qc1 != 9) | (SSL_flag_qc1 != 9)
+    if not valid_time.any():
+        LOGGER.warning("No valid data (QC1 all missing) for station %s, skip.", station_id)
+        return None
+
+    df_qc = df.loc[valid_time].copy()
+
+    Q_qc   = df_qc["Q"].to_numpy(dtype=float)
+    SSC_qc = df_qc["SSC"].to_numpy(dtype=float)
+    SSL_qc = df_qc["SSL"].to_numpy(dtype=float)
+
+    # time:days since 1970-01-01
+    base = np.datetime64("1970-01-01T00:00:00")
+    time_qc = ((df_qc.index.values.astype("datetime64[ns]") - base) / np.timedelta64(1, "D")).astype(float)
+
+    # 3) End-to-end QC
+    qc = apply_hydro_qc_with_provenance(
+        time=time_qc,
+        Q=Q_qc,
+        SSC=SSC_qc,
+        SSL=SSL_qc,
+        Q_is_independent=True,
+        SSC_is_independent=True,
+        SSL_is_independent=True,
+        ssl_is_derived_from_q_ssc=False,
+        qc2_k=1.5,
+        qc2_min_samples=5,
+        qc3_k=1.5, 
+        qc3_min_samples=5,
     )
 
-    # =========================
-    # QC: log-IQR + SSC–Q consistency
-    # =========================
+    if qc is None:
+        LOGGER.warning("No valid time remains after hydro QC for station %s, skip.", station_id)
+        return None
 
-    # Step 1: log-IQR bounds
-    ssc_lower, ssc_upper = compute_log_iqr_bounds(ssc_arr)
-    ssl_lower, ssl_upper = compute_log_iqr_bounds(ssl_arr)
+    df["Q_flag"] = np.full(len(df), FLAG_MISS, dtype=np.int8)
+    df["SSC_flag"] = np.full(len(df), FLAG_MISS, dtype=np.int8)
+    df["SSL_flag"] = np.full(len(df), FLAG_MISS, dtype=np.int8)
 
-    q_flag = np.full(len(q_arr), FLAG_MISS, dtype=np.int8)
-    ssc_flag = np.full(len(ssc_arr), FLAG_MISS, dtype=np.int8)
-    ssl_flag = np.full(len(ssl_arr), FLAG_MISS, dtype=np.int8)
+    df.loc[df_qc.index, "Q_flag"] = qc["Q_flag"].astype(np.int8)
+    df.loc[df_qc.index, "SSC_flag"] = qc["SSC_flag"].astype(np.int8)
+    df.loc[df_qc.index, "SSL_flag"] = qc["SSL_flag"].astype(np.int8)
 
-    for i in range(len(q_arr)):
-        q = q_arr[i]
-        ssc = ssc_arr[i]
-        ssl = ssl_arr[i]
-
-        # ---- basic QC (missing / physical) ----
-        qf = apply_quality_flag(q, "Q")
-        sscf = apply_quality_flag(ssc, "SSC")
-        sslf = apply_quality_flag(ssl, "SSL")
-
-        # ---- log-IQR statistical outliers ----
-        if sscf == FLAG_GOOD and ssc_lower and ssc_upper:
-            if ssc < ssc_lower or ssc > ssc_upper:
-                sscf = FLAG_SUSPECT
-
-        if sslf == FLAG_GOOD and ssl_lower and ssl_upper:
-            if ssl < ssl_lower or ssl > ssl_upper:
-                sslf = FLAG_SUSPECT
-
-        # ---- SSC–Q hydrological consistency (station-level) ----
-        is_inconsistent, resid = check_ssc_q_consistency(
-            Q=q,
-            SSC=ssc,
-            Q_flag=qf,
-            SSC_flag=sscf,
-            ssc_q_bounds=ssc_q_bounds
-        )
-
-        if is_inconsistent:
-            if sscf == FLAG_GOOD:
-                sscf = np.int8(FLAG_SUSPECT)
-
-            sslf = propagate_ssc_q_inconsistency_to_ssl(
-                inconsistent=is_inconsistent,
-                Q=q,
-                SSC=ssc,
-                SSL=ssl,
-                Q_flag=qf,
-                SSC_flag=sscf,
-                SSL_flag=sslf,
-                ssl_is_derived_from_q_ssc=False,  # Dethier 这里一般设 False（保守）
-            )
-
-        q_flag[i] = qf
-        ssc_flag[i] = sscf
-        ssl_flag[i] = sslf
-
-    df["Q_flag"] = q_flag
-    df["SSC_flag"] = ssc_flag
-    df["SSL_flag"] = ssl_flag
+    print(
+        f"[QC] {station_id} QC1(good cnt): Q={int(np.sum(Q_flag_qc1==0))}, "
+        f"SSC={int(np.sum(SSC_flag_qc1==0))}, SSL={int(np.sum(SSL_flag_qc1==0))} | "
+        f"Final(good cnt): Q={int(np.sum(df['Q_flag'].to_numpy()==0))}, "
+        f"SSC={int(np.sum(df['SSC_flag'].to_numpy()==0))}, SSL={int(np.sum(df['SSL_flag'].to_numpy()==0))}"
+    )
 
     # ---- 时间切片：至少有一个变量非 NaN 且 flag 不是 missing/bad ----
     valid_mask = (
@@ -459,12 +448,15 @@ def process_single_netcdf(nc_path: str, output_dir: str) -> dict | None:
 
     # 最终时间序列：从第一条有效到最后一条有效，中间允许 NaN 和非 good flag
     df_final = df.loc[start_date:end_date].copy()
-    
+    q_flags   = df_final["Q_flag"].to_numpy(np.int8)
+    ssc_flags = df_final["SSC_flag"].to_numpy(np.int8)
+    ssl_flags = df_final["SSL_flag"].to_numpy(np.int8)
+
     LOGGER.debug(
         "QC flags count: Q=%d, SSC=%d, SSL=%d",
-        np.sum(q_flag == FLAG_GOOD),
-        np.sum(ssc_flag == FLAG_GOOD),
-        np.sum(ssl_flag == FLAG_GOOD)
+            np.sum(q_flags == FLAG_GOOD),
+            np.sum(ssc_flags == FLAG_GOOD),
+            np.sum(ssl_flags == FLAG_GOOD),
     )
 
     # ---- 构建最终 Dataset ----
